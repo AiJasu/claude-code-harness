@@ -4,8 +4,9 @@
 
 Give Claude Code this prompt:
 
-> Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness: clone it to
-> ~/claude-code-harness, then follow the "Install steps for Claude" section of its README.
+```text
+Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness: clone it to ~/claude-code-harness, then follow the "Install steps for Claude" section of its README.
+```
 
 Claude checks your setup, shows you what will change ([Before you install](#before-you-install)),
 backs up your files, and asks before it replaces or merges anything of yours. The steps it follows
