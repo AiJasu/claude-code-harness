@@ -1,5 +1,19 @@
 # claude-code-harness
 
+## How to install
+
+The quick way: paste this into Claude Code.
+
+> Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness. Follow the
+> "Install by hand" section of its README step by step: clone it to a separate folder (not into
+> ~/.claude), back up my CLAUDE.md and settings.json, and merge instead of overwriting. Ask me
+> before replacing any skill of mine, and show me the merged settings.json before you write it.
+
+Read [Before you install](#before-you-install) first: this setup changes how Claude Code behaves.
+To do it yourself, follow [Install by hand](#install-by-hand) below.
+
+## About
+
 A ready-made setup for Claude Code: global instructions, hooks that enforce them, skills for the
 start and end of a session, and a terse output style.
 
@@ -50,7 +64,7 @@ The two guard hooks fail closed (`"onFailure": "block"`): if `node` is missing o
 start, tool calls are blocked until you fix it. Hook commands use `$HOME`; if your hook shell does
 not expand it, replace it with the absolute path to your home folder.
 
-## Install
+## Install by hand
 
 Never clone this repo into `~/.claude` itself, and never put `~/.claude` under git with a remote.
 That folder holds your login credentials and transcripts.
@@ -109,15 +123,6 @@ If your settings pin a default model (a `model` key), also set `CLAUDE_MODEL_PIN
 [Configuration](#configuration)), or the drift check will remind you about the pin at every start.
 
 **6. Restart Claude Code** and run `/hooks` to see what loaded.
-
-### Install with Claude Code
-
-You can also ask Claude Code to do it. Paste this:
-
-> Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness. Follow the
-> Install section of its README step by step: clone it to a separate folder (not into ~/.claude),
-> back up my CLAUDE.md and settings.json, and merge instead of overwriting. Ask me before replacing
-> any skill of mine, and show me the merged settings.json before you write it.
 
 ## Configuration
 
