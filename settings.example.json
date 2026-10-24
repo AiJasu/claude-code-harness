@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(**/.env)",
+      "Read(**/.env.local)",
+      "Read(**/.env.*.local)",
+      "Read(**/.env.production)",
+      "Read(**/.env.development)",
+      "Read(**/secrets/**)",
+      "Read(**/.ssh/**)",
+      "Read(~/.ssh/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/*.p12)",
+      "Read(**/*.pfx)",
+      "Read(**/id_rsa)",
+      "Read(**/id_ed25519)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.aws/**)",
+      "Read(~/.npmrc)",
+      "Read(~/.netrc)",
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.docker/config.json)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|ExitWorktree|WebFetch|WebSearch|mcp__claude-in-chrome__form_input|mcp__claude-in-chrome__computer",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/guard-hook.js\"", "timeout": 10, "onFailure": "block" }]
+      },
+      {
+        "matcher": "mcp__claude-in-chrome__.*",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/browser-guard.js\"", "timeout": 10 }]
+      },
+      {
+        "matcher": "Agent|Task|Workflow|ScheduleWakeup",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/model-routing-guard.js\"", "timeout": 10, "onFailure": "block" }]
+      },
+      {
+        "matcher": "Bash|PowerShell|Read",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/poll-guard.js\"", "timeout": 10 }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/context-nudge.js\"", "timeout": 10 },
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/skill-nudge.js\"", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/worktree-brief.js\"", "timeout": 10 }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/error-logger.js\"", "timeout": 10 }]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/session-start.js\"", "timeout": 10 },
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/handoff-surface.js\"", "timeout": 10 },
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/config-drift-check.js\"", "timeout": 10 }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/pre-compact-guidance.js\"", "timeout": 10 }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/detect-orphans.js\"", "timeout": 20, "async": true },
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/reply-lint.js\"", "timeout": 10, "async": true },
+          { "type": "command", "command": "node \"$HOME/.claude/hooks/wf-concurrency.js\"", "timeout": 10, "async": true }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/hooks/detect-orphans.js\"", "timeout": 20, "async": true }]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node \"$HOME/.claude/hooks/statusline.js\"",
+    "padding": 0,
+    "refreshInterval": 60
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "node \"$HOME/.claude/hooks/subagent-statusline.js\""
+  },
+  "outputStyle": "Terse",
+  "autoCompactWindow": 300000
+}

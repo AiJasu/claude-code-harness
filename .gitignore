@@ -1,0 +1,9 @@
+# Test sandboxes the fixture suites create next to themselves
+hooks/tests/.fakehome*/
+hooks/tests/.fakeproj*/
+hooks/tests/.check-wf-tmp/
+hooks/tests/.fixture-scripts-*/
+hooks/tests/.tmp*
+__pycache__/
+*.pyc
+node_modules/
