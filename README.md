@@ -1,5 +1,8 @@
 # claude-code-harness
 
+A ready-made Claude Code setup: global instructions, hooks that enforce them, session skills and a
+terse output style.
+
 ## How to install
 
 Give Claude Code this prompt:
@@ -13,9 +16,6 @@ backs up your files, and asks before it replaces or merges anything of yours. Th
 are in [Install steps for Claude](#install-steps-for-claude).
 
 ## About
-
-A ready-made setup for Claude Code: global instructions, hooks that enforce them, skills for the
-start and end of a session, and a terse output style.
 
 The idea behind it: a rule in `CLAUDE.md` is a request, a hook is a guarantee. Where a rule kept
 getting broken, a hook now checks it. Dangerous cases are blocked, the rest get a warning, and most
@@ -122,6 +122,28 @@ steps by hand.)
    remind them about the pin at every start.
 7. **Finish.** Report which files you copied, merged or skipped, then tell the user to restart
    Claude Code and run `/hooks` to see what loaded.
+
+## Update
+
+Give Claude Code this prompt:
+
+```text
+Update the Claude Code harness: follow the "Update" section of the README in ~/claude-code-harness.
+```
+
+Claude: follow these steps in order.
+
+1. **Pull.** Run `git -C ~/claude-code-harness pull --ff-only`. If it says "Already up to date",
+   tell the user and stop. Otherwise show them what changed:
+   `git -C ~/claude-code-harness log --oneline ORIG_HEAD..HEAD`.
+2. **Copy the runtime folders again**, as in install step 4, keeping any skill the user chose to
+   keep then. This overwrites the harness's own files in `~/.claude`; if the user has edited any of
+   them, ask before copying.
+3. **Merge new settings and instructions.** Run
+   `git -C ~/claude-code-harness diff ORIG_HEAD HEAD -- CLAUDE.md settings.example.json`. If it
+   shows changes, show them to the user and merge the ones they want, the same way as install steps
+   5 and 6. Never overwrite their files.
+4. **Finish.** Report what you updated, then tell the user to restart Claude Code.
 
 ## Configuration
 
@@ -236,11 +258,26 @@ set `HARNESS_LIVE_TESTS=1`.
 
 ## Uninstall
 
-1. Remove the entries you merged from `~/.claude/settings.json` (or restore `settings.json.bak`).
-2. Restore `~/.claude/CLAUDE.md.bak`, or delete the sections you added.
-3. Delete the files you copied: every path this repo has under `hooks/`, `agents/`, `tools/` and
-   `output-styles/`, plus `gotchas.md` and the skills listed in step 4 of the install. Files of your
-   own in those folders stay.
+Give Claude Code this prompt:
+
+```text
+Uninstall the Claude Code harness: follow the "Uninstall" section of the README in ~/claude-code-harness.
+```
+
+It takes two rounds with a restart in between. The two guard hooks fail closed, so deleting their
+files while Claude Code still has them loaded would block every tool call.
+
+Claude: if `~/.claude/settings.json` still lists this repo's hooks, do steps 1 and 2, then ask the
+user to restart Claude Code and send the prompt again. If it no longer lists them, do step 3.
+
+1. Remove the entries that were merged from `settings.example.json` out of
+   `~/.claude/settings.json` (or restore `settings.json.bak`). Show the user the result before you
+   write it.
+2. Restore `~/.claude/CLAUDE.md.bak`, or delete the sections that were added.
+3. Delete the copied files: every path this repo has under `hooks/`, `agents/`, `tools/` and
+   `output-styles/`, plus `gotchas.md` and the skills listed in step 4 of the install. Files of the
+   user's own in those folders stay. Then tell the user the harness is gone and that
+   `~/claude-code-harness` can be deleted too.
 
 ## License
 
