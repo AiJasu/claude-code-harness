@@ -2,15 +2,14 @@
 
 ## How to install
 
-The quick way: paste this into Claude Code.
+Give Claude Code this prompt:
 
-> Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness. Follow the
-> "Install by hand" section of its README step by step: clone it to a separate folder (not into
-> ~/.claude), back up my CLAUDE.md and settings.json, and merge instead of overwriting. Ask me
-> before replacing any skill of mine, and show me the merged settings.json before you write it.
+> Install the Claude Code harness from https://github.com/AiJasu/claude-code-harness: clone it to
+> ~/claude-code-harness, then follow the "Install steps for Claude" section of its README.
 
-Read [Before you install](#before-you-install) first: this setup changes how Claude Code behaves.
-To do it yourself, follow [Install by hand](#install-by-hand) below.
+Claude checks your setup, shows you what will change ([Before you install](#before-you-install)),
+backs up your files, and asks before it replaces or merges anything of yours. The steps it follows
+are in [Install steps for Claude](#install-steps-for-claude).
 
 ## About
 
@@ -64,65 +63,64 @@ The two guard hooks fail closed (`"onFailure": "block"`): if `node` is missing o
 start, tool calls are blocked until you fix it. Hook commands use `$HOME`; if your hook shell does
 not expand it, replace it with the absolute path to your home folder.
 
-## Install by hand
+## Install steps for Claude
 
-Never clone this repo into `~/.claude` itself, and never put `~/.claude` under git with a remote.
-That folder holds your login credentials and transcripts.
+Claude: when a user asks you to install this harness, follow these steps in order. Never overwrite
+a file of the user's without asking first. (Someone installing without Claude can run the same
+steps by hand.)
 
-**1. Get the files.**
+1. **Check and confirm.** Run `node --version` (18 or newer is required) and, on Windows, check
+   that Git Bash is installed. Show the user the [Before you install](#before-you-install) list and
+   wait for their go before you change anything.
+2. **Clone to a separate folder**, never into `~/.claude`: that folder holds the user's login
+   credentials and transcripts, and must never go under git with a remote. Skip this if the repo
+   is already cloned.
 
-```sh
-git clone https://github.com/AiJasu/claude-code-harness ~/claude-code-harness
-cd ~/claude-code-harness
-```
+   ```sh
+   git clone https://github.com/AiJasu/claude-code-harness ~/claude-code-harness
+   cd ~/claude-code-harness
+   ```
 
-**2. Back up what you already have.**
+3. **Back up** the user's files and list their skills:
 
-```sh
-mkdir -p ~/.claude
-cp ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.bak 2>/dev/null
-cp ~/.claude/settings.json ~/.claude/settings.json.bak 2>/dev/null
-ls ~/.claude/skills 2>/dev/null
-```
+   ```sh
+   mkdir -p ~/.claude
+   cp ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.bak 2>/dev/null
+   cp ~/.claude/settings.json ~/.claude/settings.json.bak 2>/dev/null
+   ls ~/.claude/skills 2>/dev/null
+   ```
 
-**3. Copy the runtime folders.** This replaces any skill of yours with the same name (`best`,
-`careful`, `commit`, `critic-loop`, `debug`, `drive-screen`, `execute`, `freeze`, `guard-off`,
-`handoff`, `plan`, `prime`, `security-scan`, `spec`, `wrap`). Rename yours first if the `ls` above
-showed a clash.
+4. **Copy the runtime folders.** This repo ships these skills: `best`, `careful`, `commit`,
+   `critic-loop`, `debug`, `drive-screen`, `execute`, `freeze`, `guard-off`, `handoff`, `plan`,
+   `prime`, `security-scan`, `spec`, `wrap`. If the list from step 3 has any of these names, ask the
+   user whether to replace theirs or keep it; for a kept one, copy the skills one by one and leave
+   that name out. With no clash:
 
-```sh
-cp -r hooks skills agents tools output-styles gotchas.md ~/.claude/
-```
+   ```sh
+   cp -r hooks skills agents tools output-styles gotchas.md ~/.claude/
+   ```
 
-**4. Add the instructions.** If you have no `~/.claude/CLAUDE.md`, copy it:
+5. **Add the instructions.** If there is no `~/.claude/CLAUDE.md`, copy ours:
+   `cp CLAUDE.md ~/.claude/CLAUDE.md`. If there is one, do not overwrite it: show the user the
+   sections of ours, merge only the ones they pick, and keep their own rules. Keep our last line,
+   `@~/.claude/gotchas.md`, which loads the gotchas file.
+6. **Wire the hooks.** If there is no `~/.claude/settings.json`, copy the example:
+   `cp settings.example.json ~/.claude/settings.json`. If there is one, merge these keys from
+   `settings.example.json` and keep everything else, then show the user the merged file and write
+   it only after they agree:
 
-```sh
-cp CLAUDE.md ~/.claude/CLAUDE.md
-```
+   | Key | How to merge |
+   |-----|--------------|
+   | `hooks` | Append each entry to the matching event list. Keep the user's own hooks. |
+   | `permissions.deny` | Append the entries. |
+   | `statusLine`, `subagentStatusLine` | Take ours, unless the user wants to keep theirs. |
+   | `attribution`, `outputStyle`, `autoCompactWindow` | Take ours, unless the user set them on purpose. |
 
-If you already have one, merge by hand: keep your own rules and add the sections you want. Keep the
-last line, `@~/.claude/gotchas.md`, which loads the gotchas file.
-
-**5. Wire the hooks.** If you have no `~/.claude/settings.json`, copy the example:
-
-```sh
-cp settings.example.json ~/.claude/settings.json
-```
-
-If you already have one, merge these keys from `settings.example.json` into it and keep everything
-else:
-
-| Key | How to merge |
-|-----|--------------|
-| `hooks` | Append each entry to the matching event list. Keep your own hooks. |
-| `permissions.deny` | Append the entries. |
-| `statusLine`, `subagentStatusLine` | Take ours, or keep yours. |
-| `attribution`, `outputStyle`, `autoCompactWindow` | Take ours unless you set them on purpose. |
-
-If your settings pin a default model (a `model` key), also set `CLAUDE_MODEL_PIN` to that value (see
-[Configuration](#configuration)), or the drift check will remind you about the pin at every start.
-
-**6. Restart Claude Code** and run `/hooks` to see what loaded.
+   If the user's settings pin a default model (a `model` key), also add `CLAUDE_MODEL_PIN` with
+   that value to the `env` block (see [Configuration](#configuration)), or the drift check will
+   remind them about the pin at every start.
+7. **Finish.** Report which files you copied, merged or skipped, then tell the user to restart
+   Claude Code and run `/hooks` to see what loaded.
 
 ## Configuration
 
@@ -240,7 +238,7 @@ set `HARNESS_LIVE_TESTS=1`.
 1. Remove the entries you merged from `~/.claude/settings.json` (or restore `settings.json.bak`).
 2. Restore `~/.claude/CLAUDE.md.bak`, or delete the sections you added.
 3. Delete the files you copied: every path this repo has under `hooks/`, `agents/`, `tools/` and
-   `output-styles/`, plus `gotchas.md` and the skills listed in step 3 of the install. Files of your
+   `output-styles/`, plus `gotchas.md` and the skills listed in step 4 of the install. Files of your
    own in those folders stay.
 
 ## License
