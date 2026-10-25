@@ -23,8 +23,15 @@ time anyone can see that happened, it already has.
   screenctl.py key    --title "..." --keys enter
   screenctl.py click  --title "..." --x 850 --y 730 [--double|--right]
   screenctl.py scroll --title "..." --amount -3
+  screenctl.py run    --title "..." --plan '[{"key": "ctrl+t", "expect": {"title": "New Tab"}}]'
 
-Exit codes: 0 ok, 1 refused (not found / ambiguous / focus unconfirmed / bad input).
+`run` executes a short plan (at most 30 steps, one target window) in ONE call: every
+sending step goes through the same checks as the subcommand of the same name, may carry
+an `expect` that is verified from text (title, UI Automation, OCR, pixel change) before
+the next step, and the run stops at the first failure with a screenshot of the window.
+
+Exit codes: 0 ok, 1 refused (not found / ambiguous / focus unconfirmed / bad input / a
+run that failed or stopped). A command-line usage error (argparse) exits 2.
 
 CAPTURE. `shot` renders the window's OWN content through PrintWindow
 (PW_RENDERFULLCONTENT), never a copy of the screen region. A screen-region grab
@@ -42,24 +49,27 @@ detected so the restore step never overwrites it with an empty string.
 
 Every run appends one line per action to ~/.claude/screenctl/actions.log, so a run
 that went wrong is inspectable afterwards instead of being reconstructed from memory.
-Set SCREENCTL_STATE_DIR to put the log (and autodrive's prompt screenshots)
-somewhere else; the smoke tests point it at a temp folder.
+Set SCREENCTL_STATE_DIR to put the log, the run lock, `run`'s failure screenshots
+(and autodrive's prompt screenshots) somewhere else; the smoke tests point it at a
+temp folder.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime
 import os
-import platform
 import struct
 import sys
 import time
-import traceback
 import zlib
-from dataclasses import dataclass
 
-if platform.system() != "Windows":
+# No __pycache__ in the skill folder, also for the lazily imported uia / ocr modules.
+sys.dont_write_bytecode = True
+
+# sys.platform, not platform.system(): the latter queries WMI and imports socket,
+# which cost more than the rest of start-up together. datetime, dataclasses,
+# platform and traceback are imported where they are used, for the same reason.
+if sys.platform != "win32":
     print("UNSUPPORTED_OS: this build of screenctl drives Windows only.")
     print("  The upstream skill (coleam00/skills, drive-screen) has macOS and X11 backends.")
     sys.exit(1)
@@ -70,6 +80,10 @@ from ctypes import wintypes            # noqa: E402
 STATE_DIR = (os.environ.get("SCREENCTL_STATE_DIR")
              or os.path.join(os.path.expanduser("~"), ".claude", "screenctl"))
 LOG = os.path.join(STATE_DIR, "actions.log")
+
+# Clock and sleep as module names so the tests can run the wait loops on a fake clock.
+_sleep = time.sleep
+_clock = time.monotonic
 
 # Window titles routinely contain emoji and box-drawing characters. On Windows
 # stdout defaults to cp1252 when redirected, and one bullet in a browser tab title
@@ -84,14 +98,14 @@ for _s in (sys.stdout, sys.stderr):
 def log(msg: str) -> None:
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")      # same shape as isoformat(timespec="seconds")
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(f"{stamp}\t{msg}\n")
     except Exception:
         pass  # logging must never be the reason an action fails
 
 
-def die(code: str, msg: str, extra: list[str] | None = None) -> None:
+def die(code: str, msg: str, extra: list[str] | None = None, indent: str = "  ") -> None:
     """Fail with a stable, machine-readable first token, then prose.
 
     The caller is a language model. A failure it cannot classify is a failure it
@@ -101,18 +115,29 @@ def die(code: str, msg: str, extra: list[str] | None = None) -> None:
     log(f"FAIL {code}: {msg}")
     print(f"{code}: {msg}")
     for line in extra or []:
-        print(f"  {line}")
+        print(f"{indent}{line}")
     sys.exit(1)
 
 
-@dataclass
 class Win:
-    id: str          # HWND as a decimal string: printable and comparable
-    title: str
-    x: int
-    y: int
-    w: int
-    h: int
+    """A visible top-level window. Plain class (importing dataclasses slows start-up)."""
+
+    __slots__ = ("id", "title", "x", "y", "w", "h")
+
+    def __init__(self, id: str, title: str, x: int, y: int, w: int, h: int):
+        self.id = id          # HWND as a decimal string: printable and comparable
+        self.title = title
+        self.x, self.y, self.w, self.h = x, y, w, h
+
+    def __repr__(self) -> str:
+        return (f"Win(id={self.id!r}, title={self.title!r}, x={self.x}, y={self.y}, "
+                f"w={self.w}, h={self.h})")
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Win) and (self.id, self.title, self.x, self.y, self.w, self.h) == \
+            (other.id, other.title, other.x, other.y, other.w, other.h)
+
+    __hash__ = None
 
     @property
     def minimized(self) -> bool:
@@ -160,7 +185,9 @@ def encode_png_bgra(w: int, h: int, bgra: bytes) -> bytes:
     raw = b"".join(b"\x00" + buf[y * stride:(y + 1) * stride] for y in range(h))
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr)
-            + _png_chunk(b"IDAT", zlib.compress(raw, 6)) + _png_chunk(b"IEND", b""))
+            + _png_chunk(b"IDAT", zlib.compress(raw, 1)) + _png_chunk(b"IEND", b""))
+    # Level 1, not 6: roughly half the encode time on a typical UI frame for a file
+    # only a few percent larger. The size does not change what the image costs to read.
 
 
 def _png_chunks(path: str, cap: int = 6_000_000):
@@ -288,6 +315,9 @@ user32.GetWindowTextW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
 user32.GetForegroundWindow.restype = HWND
 user32.SetForegroundWindow.argtypes = [HWND]
+user32.SetForegroundWindow.restype = BOOL
+user32.IsWindow.argtypes = [HWND]
+user32.IsWindow.restype = BOOL
 user32.BringWindowToTop.argtypes = [HWND]
 user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
 user32.GetAncestor.argtypes = [HWND, UINT]
@@ -442,17 +472,22 @@ def root_window_at(x: int, y: int) -> int:
     return int(user32.GetAncestor(h, 2) or h)        # GA_ROOT
 
 
-def raise_window(win: Win) -> None:
+def _is_window(hwnd: int) -> bool:
+    return bool(user32.IsWindow(hwnd))
+
+
+def raise_window(win: Win) -> bool:
+    """Ask for the foreground; returns SetForegroundWindow's answer (False = refused)."""
     h = win.hwnd
     # SW_RESTORE only for a MINIMIZED window. Upstream restored unconditionally,
     # and SW_RESTORE on a maximized window un-maximizes it: focusing a maximized
     # editor shrank it to its last floating size on every action.
     if user32.IsIconic(h):
         user32.ShowWindow(h, 9)          # SW_RESTORE
-    user32.SetForegroundWindow(h)
+    return bool(user32.SetForegroundWindow(h))
 
 
-def force_foreground(win: Win) -> None:
+def force_foreground(win: Win) -> bool:
     # Microsoft documents SetForegroundWindow as refusable: a process may only
     # take the foreground under a specific list of conditions, one being that it
     # is attached to the thread that owns the current foreground window. Attach
@@ -472,19 +507,23 @@ def force_foreground(win: Win) -> None:
         if user32.IsIconic(win.hwnd):
             user32.ShowWindow(win.hwnd, 9)
         user32.BringWindowToTop(win.hwnd)
-        user32.SetForegroundWindow(win.hwnd)
+        return bool(user32.SetForegroundWindow(win.hwnd))
     finally:
         for t in tids:
             user32.AttachThreadInput(cur, t, False)
+
+
+def _keybd_event(vk: int, flags: int) -> None:
+    user32.keybd_event(vk, 0, flags, 0)
 
 
 def unlock_foreground() -> None:
     # Last resort. A synthetic ALT tap satisfies the "received the last input
     # event" condition, but the tap itself lands in the CURRENT foreground app,
     # and in Explorer and many classic apps a bare ALT toggles the menu bar.
-    # That is why the thread-attach route above runs first.
-    user32.keybd_event(0x12, 0, 0, 0)          # VK_MENU down
-    user32.keybd_event(0x12, 0, 0x0002, 0)     # VK_MENU up
+    # That is why the thread-attach route above runs first. `run` never uses it.
+    _keybd_event(0x12, 0)                      # VK_MENU down
+    _keybd_event(0x12, 0x0002)                 # VK_MENU up
 
 
 # --- input -----------------------------------------------------------------
@@ -616,20 +655,63 @@ def type_text(text: str, delay: float = 0.012) -> None:
         for unit in _utf16_units(ch):
             evs += [_char_ev(unit, False), _char_ev(unit, True)]
         _send(evs)
-        time.sleep(delay)
+        _sleep(delay)
+
+
+class BadKey(Exception):
+    """A name in a chord that is neither in VK nor a single character."""
+
+
+def chord_parts(keys: str) -> list[str]:
+    return [k.strip().lower() for k in keys.split("+") if k.strip()]
+
+
+# A bare punctuation character is NOT its ASCII value as a virtual key ('-' as 0x2D is
+# VK_INSERT, '[' is VK_LWIN, '_' is VK_SLEEP): these are the OEM keys, by name.
+_OEM_VK = {"-": 0xBD, ".": 0xBE, "/": 0xBF, ",": 0xBC, ";": 0xBA, "=": 0xBB, "`": 0xC0,
+           "[": 0xDB, "]": 0xDD, "\\": 0xDC, "'": 0xDE}
+_KEY_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+_OEM_CHAR = {v: k for k, v in _OEM_VK.items()}
+
+
+def parse_chord(keys: str) -> list[int]:
+    """Virtual-key codes of a chord; raises BadKey for anything else. No input is sent.
+
+    A single character is a key only when it is a-z or 0-9 (VK_A really is ord('A'))
+    or one of the OEM punctuation keys above; every other character is BadKey, and
+    so is a chord with an empty part ('+' alone, 'ctrl+'), which names no key.
+    """
+    try:
+        raw = keys.split("+")
+        for p in raw:
+            if not p.isascii():              # before lower(): U+212A (Kelvin sign) lowers to 'k'
+                raise BadKey(p)
+        parts = [k.strip().lower() for k in raw]
+        if not parts or "" in parts:
+            raise BadKey(keys)
+        codes = []
+        for p in parts:
+            if p in VK:
+                codes.append(VK[p])
+            elif p in _OEM_VK:
+                codes.append(_OEM_VK[p])
+            elif len(p) == 1 and p in _KEY_CHARS:
+                codes.append(ord(p.upper()))
+            else:
+                raise BadKey(p)
+        return codes
+    except BadKey:
+        raise
+    except Exception as e:                                   # noqa: BLE001
+        raise BadKey(str(keys)) from e
 
 
 def send_chord(keys: str) -> None:
-    parts = [k.strip().lower() for k in keys.split("+") if k.strip()]
-    codes = []
-    for p in parts:
-        if p in VK:
-            codes.append(VK[p])
-        elif len(p) == 1:
-            codes.append(ord(p.upper()))
-        else:
-            die("BAD_KEY", f"unknown key {p!r} in {keys!r}",
-                ["Known names: " + ", ".join(sorted(VK))])
+    try:
+        codes = parse_chord(keys)
+    except BadKey as e:
+        die("BAD_KEY", f"unknown key {e.args[0]!r} in {keys!r}",
+            ["Known names: " + ", ".join(sorted(VK))])
     _send([_key_ev(c, False) for c in codes] +
           [_key_ev(c, True) for c in reversed(codes)])
 
@@ -640,7 +722,7 @@ def place_cursor(x: int, y: int) -> None:
     guard checked and the pixel that gets the button are only the same if this
     reads back the requested point."""
     user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.12)
+    _sleep(0.12)
     p = wintypes.POINT()
     user32.GetCursorPos(ctypes.byref(p))
     if (p.x, p.y) != (int(x), int(y)):
@@ -653,10 +735,10 @@ def press(button: str = "left", double: bool = False) -> None:
     down, up = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010)}[button]
     for i in range(2 if double else 1):
         _send([_mouse_ev(down)])
-        time.sleep(0.06)
+        _sleep(0.06)
         _send([_mouse_ev(up)])
         if i == 0 and double:
-            time.sleep(0.05)
+            _sleep(0.05)
 
 
 def scroll(win: Win, amount: int) -> None:
@@ -665,7 +747,12 @@ def scroll(win: Win, amount: int) -> None:
     # doubly wrong: the target does not move, and whatever the mouse happens
     # to be sitting over scrolls instead. Measured upstream: a scroll aimed at
     # a text window went to a window on a different monitor.
-    place_cursor(win.x + win.w // 2, win.y + win.h // 2)
+    # The same two covered checks as a click: the wheel goes to the window under the
+    # point, so an overlay of another process there would receive the scroll instead.
+    cx, cy = win.x + win.w // 2, win.y + win.h // 2
+    _refuse_if_covered(win, cx, cy, what="scrolled")
+    place_cursor(cx, cy)
+    _refuse_if_covered(win, cx, cy, what="scrolled")
     _send([_mouse_ev(0x0800, int(amount) * 120)])          # WHEEL
 
 
@@ -682,7 +769,7 @@ def _open_clipboard() -> None:
     for _ in range(20):
         if user32.OpenClipboard(None):
             return
-        time.sleep(0.03)
+        _sleep(0.03)
     die("CLIPBOARD_BUSY", "another application is holding the clipboard open.",
         ["Nothing was pasted. Retry in a moment."])
 
@@ -805,18 +892,51 @@ class _DIB:
         self.old = self.bmp = self.dc = None
 
 
-def capture(win: Win, out: str, max_width: int) -> None:
-    """Render the window's own content to a PNG. Never a screen-region grab.
+def parse_region(text: str) -> tuple[int, int, int, int]:
+    """'x,y,w,h' (window pixels) to a tuple; BAD_REGION when it is not four integers, w,h > 0."""
+    try:
+        x, y, w, h = (int(p) for p in text.replace(" ", "").split(","))
+    except ValueError:
+        die("BAD_REGION", f"--region wants x,y,w,h as four integers, got {text!r}")
+    if w <= 0 or h <= 0:
+        die("BAD_REGION", f"--region width and height must be positive, got {text!r}")
+    return x, y, w, h
+
+
+def region_geometry(win: Win, region, iw: int | None = None) -> dict:
+    """Pure arithmetic of a region shot: REGION_OUTSIDE check, origin and scale.
+
+    region is window-relative physical pixels (x, y, w, h). The crop is taken
+    first and only then downscaled to `iw` pixels wide, so IMAGE_SCALE is
+    image width over REGION width and WINDOW_ORIGIN is the window origin plus
+    the region offset: the printed click arithmetic stays right.
+    """
+    if region is None:
+        return {"x": 0, "y": 0, "w": win.w, "h": win.h, "origin": (win.x, win.y),
+                "scale": (iw / win.w if (iw and win.w) else 1.0)}
+    x, y, w, h = region
+    if x < 0 or y < 0 or x + w > win.w or y + h > win.h:
+        die("REGION_OUTSIDE", f"region {x},{y},{w},{h} is not inside the {win.w}x{win.h} window.",
+            ["Regions are window-relative physical pixels: 0,0 is the window's top-left."])
+    return {"x": x, "y": y, "w": w, "h": h, "origin": (win.x + x, win.y + y),
+            "scale": (iw / w if iw else 1.0)}
+
+
+def grab_bgra(win: Win, region=None, max_width: int = 0) -> tuple[int, int, bytes]:
+    """Render the window's own content: (width, height, top-down BGRA bytes).
 
     PrintWindow with PW_RENDERFULLCONTENT (Windows 8.1+) asks DWM for the
     window's composed surface, so DirectX and browser windows render too, and
     the window does not have to be in front. What it cannot do is render an
     exclusive-fullscreen app or a minimized window: those come back flat, and
-    act_shot says so rather than handing the picture over.
+    act_shot says so rather than handing the picture over. Never a
+    screen-region grab. `region` crops first, then `max_width` downscales.
     """
+    g = region_geometry(win, region)
+    rx, ry, rw, rh = g["x"], g["y"], g["w"], g["h"]
     w, h = win.w, win.h
-    tw = min(w, max_width) if max_width else w
-    th = max(1, round(h * tw / w))
+    tw = min(rw, max_width) if max_width else rw
+    th = max(1, round(rh * tw / rw))
     screen = user32.GetDC(None)
     full = small = None
     try:
@@ -827,19 +947,24 @@ def capture(win: Win, out: str, max_width: int) -> None:
         if not ok:
             die("CAPTURE_FAILED", f"PrintWindow refused {win.title!r} "
                 f"(error {ctypes.get_last_error()})")
-        if tw != w:
-            small = _DIB(screen, tw, th)
-            gdi32.SetStretchBltMode(small.dc, 4)             # HALFTONE: averaged
-            gdi32.SetBrushOrgEx(small.dc, 0, 0, None)
-            gdi32.StretchBlt(small.dc, 0, 0, tw, th, full.dc, 0, 0, w, h, 0x00CC0020)
-            png = encode_png_bgra(tw, th, small.bytes())
-        else:
-            png = encode_png_bgra(w, h, full.bytes())
+        if (tw, th, rx, ry) == (w, h, 0, 0):
+            return w, h, full.bytes()
+        small = _DIB(screen, tw, th)
+        gdi32.SetStretchBltMode(small.dc, 4)                 # HALFTONE: averaged
+        gdi32.SetBrushOrgEx(small.dc, 0, 0, None)
+        gdi32.StretchBlt(small.dc, 0, 0, tw, th, full.dc, rx, ry, rw, rh, 0x00CC0020)
+        return tw, th, small.bytes()
     finally:
         for d in (small, full):
             if d:
                 d.close()
         user32.ReleaseDC(None, screen)
+
+
+def capture(win: Win, out: str, max_width: int, region=None) -> None:
+    """Render the window's own content to a PNG (see grab_bgra)."""
+    tw, th, bgra = grab_bgra(win, region, max_width)
+    png = encode_png_bgra(tw, th, bgra)
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     with open(out, "wb") as f:
         f.write(png)
@@ -889,12 +1014,59 @@ def resolve(title: str, wid: str | None = None) -> Win:
     return hits[0]
 
 
-def focus(title: str, settle: float = 0.45, wid: str | None = None) -> Win:
+def _rect_of(hwnd: int):
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    return (r.left, r.top, r.right, r.bottom)
+
+
+FOCUS_POLL = 0.015       # seconds between foreground checks while a switch settles
+FOCUS_FLOOR = 0.15       # least time after a request before returning (see _wait_focused)
+
+
+def _wait_focused(win: Win, accepted: bool, settle: float, t_request: float) -> bool:
+    """True once `win` is the foreground window.
+
+    A request SetForegroundWindow REFUSED (accepted False) gets ONE check and no
+    wait: waiting out the full settle for a refusal to change its mind costs about
+    half a second per switch. An accepted request is polled every 15 ms for up
+    to `settle`; once the switch is seen the call still holds until FOCUS_FLOOR after the request,
+    because an application restores its internal control focus while it
+    activates and a keystroke sent that early can be dropped.
+
+    A window that STARTED minimized (win.minimized) must also have left the
+    parked -32000 position, with the same rectangle across two reads 15 ms
+    apart, before it counts: the foreground flips before the restore finishes.
+    """
+    deadline = t_request + (settle if accepted else 0.0)
+    prev = None
+    while True:
+        if same_window(win):
+            if not win.minimized:
+                break
+            r = _rect_of(win.hwnd)
+            if r is not None and r[0] > -30000 and r[1] > -30000 and r == prev:
+                break
+            prev = r
+        if _clock() >= deadline:
+            return False
+        _sleep(FOCUS_POLL)
+    rest = t_request + FOCUS_FLOOR - _clock()
+    if rest > 0:
+        _sleep(rest)
+    return True
+
+
+def focus(title: str, settle: float = 0.45, wid: str | None = None, unlock: bool = True) -> Win:
     """Focus, then PROVE it by comparing window IDENTITY, not title text.
 
     Comparing the foreground window's title against the requested substring passes
     whenever some other window happens to share that substring. Resolution above
     has already earned an exact handle, so identity is stricter and free.
+
+    `unlock=False` (what `run` passes) drops the last-resort ALT tap: plain
+    request, then the thread attach, then FOCUS_FAILED.
     """
     win = resolve(title, wid)
     if same_window(win):
@@ -902,9 +1074,8 @@ def focus(title: str, settle: float = 0.45, wid: str | None = None) -> Win:
         print(f"FOCUS_OK: {win.title}")
         return win
 
-    raise_window(win)
-    time.sleep(settle)
-    if same_window(win):
+    t0 = _clock()
+    if _wait_focused(win, raise_window(win), settle, t0):
         log(f"FOCUS {win.title}")
         print(f"FOCUS_OK: {win.title}")
         return resolve(title, wid)      # re-read geometry after the restore
@@ -923,20 +1094,19 @@ def focus(title: str, settle: float = 0.45, wid: str | None = None) -> Win:
              "than to the target.",
              "Switch it to windowed mode or close it, then retry."])
 
-    force_foreground(win)
-    time.sleep(settle)
-    if same_window(win):
+    t0 = _clock()
+    if _wait_focused(win, force_foreground(win), settle, t0):
         log(f"FOCUS(attach) {win.title}")
         print(f"FOCUS_OK (after thread attach): {win.title}")
         return resolve(title, wid)
 
-    unlock_foreground()
-    raise_window(win)
-    time.sleep(settle)
-    if same_window(win):
-        log(f"FOCUS(unlock) {win.title}")
-        print(f"FOCUS_OK (after unlock): {win.title}")
-        return resolve(title, wid)
+    if unlock:
+        unlock_foreground()
+        t0 = _clock()
+        if _wait_focused(win, raise_window(win), settle, t0):
+            log(f"FOCUS(unlock) {win.title}")
+            print(f"FOCUS_OK (after unlock): {win.title}")
+            return resolve(title, wid)
 
     fg = next((w for w in list_windows() if w.id == foreground_id()), None)
     die("FOCUS_FAILED",
@@ -969,16 +1139,25 @@ def _die_focus_lost(sent: int, total: int) -> None:
          "For anything this long, prefer `paste`: it is one atomic operation."])
 
 
+def _focus_a(a) -> Win:
+    """The act functions' focus: the CLI's full escalation, or run's (no ALT tap)."""
+    return focus(a.title, wid=a.id, unlock=getattr(a, "unlock", True))
+
+
 def act_shot(a) -> None:
+    region = getattr(a, "region", None)
+    if isinstance(region, str):
+        region = parse_region(region)
     if a.no_focus:
         win = resolve(a.title, a.id)
         if win.minimized:
             die("MINIMIZED", f"{win.title!r} is minimized; a minimized window renders nothing.",
                 ["Drop --no-focus so `shot` restores and focuses it first."])
     else:
-        win = focus(a.title, wid=a.id)
-        time.sleep(a.settle)      # let the UI settle before capturing it
-    capture(win, a.out, a.max_width)
+        win = _focus_a(a)
+        _sleep(a.settle)      # let the UI settle before capturing it
+    region_geometry(win, region)          # REGION_OUTSIDE before anything is rendered
+    capture(win, a.out, a.max_width, region)
     iw, ih = png_size(a.out)
     if iw == 0:
         die("CAPTURE_FAILED", f"{a.out} is not a readable PNG")
@@ -986,16 +1165,25 @@ def act_shot(a) -> None:
         print("WARNING: the capture is one flat color. The window did not render:")
         print("  an exclusive-fullscreen app, a minimized window, or a protected surface.")
         print("  Do not reason about this image. Fix the capture first.")
-    scale = iw / win.w if win.w else 1.0
+    g = region_geometry(win, region, iw)
+    scale = g["scale"]
+    ox, oy = g["origin"]
     log(f"SHOT {a.out} {iw}x{ih} scale={scale:.4f} win={win.title}")
     print(f"SHOT: {a.out}  {iw}x{ih}{'  (no focus change)' if a.no_focus else ''}")
-    print(f"WINDOW_ORIGIN: {win.x},{win.y}    IMAGE_SCALE: {scale:.4f}")
+    print(f"WINDOW_ORIGIN: {ox},{oy}    IMAGE_SCALE: {scale:.4f}")
+    if region:
+        print(f"REGION: {region[0]},{region[1]},{region[2]},{region[3]} of the window")
     print("To click what you see at image pixel (px,py), pass:")
-    print(f"  --x {win.x} + px/{scale:.4f}    --y {win.y} + py/{scale:.4f}")
+    print(f"  --x {ox} + px/{scale:.4f}    --y {oy} + py/{scale:.4f}")
     if abs(scale - 1.0) > 0.01:
         print("  The scale is not 1. The image is not in screen pixels; divide.")
     print("The image is the window's own content: anything floating ON TOP of it")
     print("(an overlay, a topmost tool window) is not shown. `click` checks for that.")
+
+
+def control_char(text: str):
+    """The first character `type` must refuse: a control character other than TAB, or DEL."""
+    return next((c for c in text if (ord(c) < 0x20 and c != "\t") or ord(c) == 0x7F), None)
 
 
 def act_type(a) -> None:
@@ -1004,7 +1192,12 @@ def act_type(a) -> None:
             ["In a full-screen terminal UI a newline SUBMITS, so the first line",
              "would be sent as a prompt and the rest typed into whatever follows.",
              "Use `paste` for anything multi-line."])
-    win = focus(a.title, wid=a.id)
+    bad = control_char(a.text)
+    if bad is not None:
+        die("CONTROL_IN_TYPE", f"refusing: --text contains the control character U+{ord(bad):04X}.",
+            ["Typed as Unicode input, a control character reaches some applications as",
+             "Escape, Backspace or Enter. Nothing was sent. Use `key` for those."])
+    win = _focus_a(a)
 
     # Focus is checked once, before the send. That check goes STALE while a long
     # string is still going out, because typing is a stream of separate events
@@ -1025,7 +1218,7 @@ def act_type(a) -> None:
                                   f"before Windows refused the rest.")
         sent += len(piece)
 
-    time.sleep(0.25)
+    _sleep(0.25)
     # The last chunk is unverified until now, so the success line below would
     # otherwise be a claim about events nobody confirmed arrived.
     if not same_window(win):
@@ -1051,7 +1244,7 @@ def act_paste(a) -> None:
 
     # Prove the target BEFORE touching the clipboard: a NOT_FOUND, AMBIGUOUS or
     # FOCUS_FAILED after the write would leave the payload on the clipboard.
-    win = focus(a.title, wid=a.id)
+    win = _focus_a(a)
 
     # The clipboard belongs to the human. Borrow it and give it back, on every
     # exit path: die() raises SystemExit, and the finally below runs through it.
@@ -1063,7 +1256,7 @@ def act_paste(a) -> None:
 
     try:
         set_clipboard(payload)
-        time.sleep(0.1)
+        _sleep(0.1)
 
         # Compare normalized. A round trip through the OS clipboard routinely
         # adds or drops one trailing newline, and a strict compare turns a paste
@@ -1080,7 +1273,7 @@ def act_paste(a) -> None:
             send_chord(PASTE_CHORD)
         except InputBlocked as e:
             _die_input_blocked(e, "Nothing was pasted.")
-        time.sleep(0.6)
+        _sleep(0.6)
         log(f"PASTE {len(payload)} chars into {win.title!r}")
         print(f"PASTED {len(payload)} chars (line endings as CRLF; no Enter sent)")
     finally:
@@ -1092,44 +1285,141 @@ def act_paste(a) -> None:
                 print("CLIPBOARD_RESTORE_FAILED (the payload is still on the clipboard)")
 
 
-def _refuse_if_covered(win: Win, x: int, y: int) -> None:
+def _refuse_if_covered(win: Win, x: int, y: int, what: str = "clicked") -> None:
     root = root_window_at(x, y)
     if not root:
         die("CLICK_COVERED", f"({x},{y}) is inside {win.title!r} but no window receives a "
             "click there (off the desktop, or a window is being destroyed).",
-            ["Nothing was clicked. Screenshot again and recompute the point."])
+            [f"Nothing was {what}. Screenshot again and recompute the point."])
     if _pid_of(root) != _pid_of(win.hwnd):
         cover = _title_of(root) or f"hwnd {root}"
         die("CLICK_COVERED", f"({x},{y}) would hit {cover!r}, not {win.title!r}.",
-            ["Something is floating on top of the target at that point (an overlay,",
+            [f"Nothing was {what}.",
+             "Something is floating on top of the target at that point (an overlay,",
              "a topmost tool window). It is not in the screenshot because the",
              "screenshot is the target's own content. Move or close it, or use keys."])
 
 
-def act_click(a) -> None:
-    win = focus(a.title, wid=a.id)
-    if not win.contains(a.x, a.y):
-        die("CLICK_OUTSIDE", f"({a.x},{a.y}) is outside {win.title!r} "
+def _click_checked(a, win: Win, x: int, y: int, also_before_press=None) -> None:
+    """The one click path: contains, covered check, pointer, covered check, press.
+
+    The screenshot shows the window's own content, not what is stacked on top
+    of it. Ask the OS what actually receives a click at this point; a popup,
+    menu or dialog of the SAME process is fine (that is how menus work), any
+    other process means an overlay is covering the target, and NO window
+    means the point is off the desktop. Checked twice: once now, once after
+    the pointer has provably arrived, right before the button goes down.
+    `also_before_press` is an extra check `click_uia` adds after the second look.
+    """
+    if not win.contains(x, y):
+        die("CLICK_OUTSIDE", f"({x},{y}) is outside {win.title!r} "
             f"at {win.x},{win.y} {win.w}x{win.h}.",
             ["Screenshot again and redo the WINDOW_ORIGIN / IMAGE_SCALE arithmetic."])
-    # The screenshot shows the window's own content, not what is stacked on top
-    # of it. Ask the OS what actually receives a click at this point; a popup,
-    # menu or dialog of the SAME process is fine (that is how menus work), any
-    # other process means an overlay is covering the target, and NO window
-    # means the point is off the desktop. Checked twice: once now, once after
-    # the pointer has provably arrived, right before the button goes down.
-    _refuse_if_covered(win, a.x, a.y)
-    place_cursor(a.x, a.y)
-    _refuse_if_covered(win, a.x, a.y)
+    _refuse_if_covered(win, x, y)
+    place_cursor(x, y)
+    _refuse_if_covered(win, x, y)
+    if also_before_press:
+        also_before_press()
     try:
         press("right" if a.right else "left", a.double)
     except InputBlocked as e:
         _die_input_blocked(e, "Nothing was clicked.")
+
+
+def act_click(a) -> None:
+    win = _focus_a(a)
+    _click_checked(a, win, a.x, a.y)
     log(f"CLICK {a.x},{a.y} in {win.title!r}")
     print(f"CLICKED {a.x},{a.y}"
           f"{' (double)' if a.double else ''}{' (right)' if a.right else ''}")
-    print("Screenshot again before the next click. Any click can move the layout,")
-    print("and coordinates from a stale image land somewhere else entirely.")
+    if not getattr(a, "quiet", False):             # advice for a CLI caller; `run` says it once
+        print("Screenshot again before the next click. Any click can move the layout,")
+        print("and coordinates from a stale image land somewhere else entirely.")
+
+
+def act_key(a) -> None:
+    win = _focus_a(a)
+    try:
+        send_chord(a.keys)
+    except InputBlocked as e:
+        _die_input_blocked(e, "The chord was not delivered.")
+    if getattr(a, "delay", True):
+        _sleep(0.3)
+    log(f"KEY {a.keys} into {win.title!r}")
+    print(f"SENT: {a.keys}")
+
+
+def act_scroll(a) -> None:
+    win = _focus_a(a)
+    try:
+        scroll(win, a.amount)
+    except InputBlocked as e:
+        _die_input_blocked(e, "Nothing was scrolled.")
+    log(f"SCROLL {a.amount} in {win.title!r}")
+    print(f"SCROLLED {a.amount}")
+
+
+def _name_key(s: str) -> str:
+    """Accelerator markers stripped, trimmed, case-folded: how click_uia compares names."""
+    return s.replace("&", "").strip().lower()
+
+
+def _lazy_module(name: str):
+    """Import uia / ocr from this script's folder, only when `run` needs them."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    return __import__(name)
+
+
+def act_click_uia(a) -> None:
+    """Click the ONE UI Automation element whose NAME equals a.name (read-only tree,
+    real pointer click through the same checked path as `click`)."""
+    uia = _lazy_module("uia")
+    win = _focus_a(a)
+    try:
+        found, truncated = uia.find(win.hwnd, a.name, a.control, exact=True,
+                                    timeout_s=getattr(a, "timeout_s", 2.0))
+    except uia.Unavailable as e:
+        die("UIA_UNAVAILABLE", str(e), ["Nothing was clicked. Use a coordinate click after a screenshot."])
+    if truncated:
+        die("UIA_TRUNCATED", "the UI Automation tree was cut short (too large or too slow),"
+            " so a missing or unique match cannot be trusted.",
+            ["Nothing was clicked. Use a coordinate click after a screenshot."])
+    want = _name_key(a.name)
+    cands = []
+    for el in found:
+        l, t, r, b = el["rect"]
+        cx, cy = (l + r) // 2, (t + b) // 2
+        if (_name_key(el["name"]) != want or el.get("offscreen") or not el.get("enabled", True)
+                or r <= l or b <= t or not win.contains(cx, cy)):
+            continue
+        cands.append((el, cx, cy))
+    if not cands:
+        die("UIA_NOT_FOUND", f"no clickable element is named {a.name!r}"
+            f"{' (control ' + a.control + ')' if a.control else ''}.",
+            ["Nothing was clicked. Offscreen, disabled and zero-size elements are skipped."])
+    if len(cands) > 1:
+        lines = [f'CANDIDATE: {el["control"]} "{el["name"]}" rect={el["rect"][0]},{el["rect"][1]},'
+                 f'{el["rect"][2]},{el["rect"][3]}' for el, _, _ in cands[:10]]
+        die("AMBIGUOUS", f"{a.name!r} names {len(cands)} elements. Refusing; pass `control` "
+            "to separate them, or click by coordinates.", lines, indent="")
+    el, cx, cy = cands[0]
+
+    def same_element() -> None:
+        try:
+            hit = uia.hit_test(cx, cy, el["runtime_id"], timeout_s=getattr(a, "timeout_s", 2.0))
+        except uia.Unavailable as e:
+            die("UIA_UNAVAILABLE", str(e), ["Nothing was clicked."])
+        if not hit:
+            die("CLICK_UIA_MISMATCH", f"the element under ({cx},{cy}) is not the {el['control']}"
+                f" {a.name!r} that was found.",
+                ["Nothing was clicked. The layout changed between the lookup and the click."])
+
+    _click_checked(a, win, cx, cy, also_before_press=same_element)
+    log(f"CLICK_UIA {a.name!r} at {cx},{cy} in {win.title!r}")
+    print(f"CLICKED {cx},{cy}{' (double)' if a.double else ''}{' (right)' if a.right else ''}")
+    print(f'CLICKED_UIA: {el["control"]} "{el["name"]}"')
 
 
 def act_doctor(a) -> None:
@@ -1138,6 +1428,7 @@ def act_doctor(a) -> None:
     Nothing here changes focus: the capture probe renders the window that is
     already in front, and the clipboard probe puts back what it found.
     """
+    import platform
     print(f"os:      {platform.platform()}")
     print(f"python:  {sys.version.split()[0]}")
     print(f"log:     {LOG}")
@@ -1207,11 +1498,998 @@ def act_doctor(a) -> None:
     sys.exit(0 if ok else 1)
 
 
+# ==========================================================================
+# run: a plan of actions, a text check after each, one tool call
+# ==========================================================================
+#
+# Every sending step is the same code path as the subcommand of the same name
+# (focus, then the act_* function), so the checks that make the CLI safe are the
+# checks the plan gets: CLICK_COVERED twice, per-character focus checks in type,
+# clipboard borrow-and-restore in paste, the fullscreen refusal in focus. What
+# `run` adds is a whole-plan validation before the first step, a text `expect`
+# after a step in place of a screenshot Read, and a stop at the first failure.
+
+MAX_STEPS = 30
+SLEEP_MAX = 3.0
+RUN_CAP = 100.0                 # seconds; a plan whose worst case is longer is refused
+DEFAULT_TIMEOUT = 3.0
+MAX_TIMEOUT = 30.0
+DEADLINE_GRACE = 0.05           # timer slack only: the cap itself funds every step (_step_cost)
+RUN_LOCK_STALE = 600.0         # a lock file older than this is stale whatever its pid says
+
+_SEND_ACTIONS = ("key", "type", "paste", "paste_file", "click", "click_uia", "scroll")
+_ACTIONS = ("focus", "shot", "wait", "sleep") + _SEND_ACTIONS
+_ACTION_OPTS = {"click": ("button", "double"),
+                "shot": ("no_focus", "max_width", "region", "settle")}
+_COND_KINDS = ("title", "window", "window_gone", "uia", "ocr", "changed", "stable")
+_TARGET_KINDS = ("title", "uia", "ocr", "changed", "stable")        # these read the target window
+_WINDOW_KINDS = ("window", "window_gone")
+
+
+class PlanError(Exception):
+    """A plan problem; `step` is the 1-based step number, or None for the whole plan."""
+
+    def __init__(self, step, msg: str):
+        super().__init__(msg)
+        self.step = step
+
+
+class _ExpectFailed(Exception):
+    def __init__(self, reason: str, sent: bool = True, kind: str | None = None):
+        super().__init__(reason)
+        self.sent = sent
+        self.kind = kind                # the condition kind to name, when it is not the step's own
+
+
+def _bad(i, token: str, msg: str):
+    raise PlanError(i, f"{token}: {msg}")
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _plan_region(i, v, what: str) -> tuple:
+    if (not isinstance(v, (list, tuple)) or len(v) != 4 or not all(_is_int(n) for n in v)
+            or v[2] <= 0 or v[3] <= 0):
+        _bad(i, "BAD_REGION", f"{what} must be [x, y, w, h] integers with w and h above 0")
+    return tuple(v)
+
+
+def _text_field(i, v, what: str, payload: bool = False) -> str:
+    """A text field. Names, paths and condition text must have content (strip()); a
+    `payload` (what type and paste send) refuses only the empty string, because
+    whitespace-only text is something a person can mean to type."""
+    if not isinstance(v, str) or not (v if payload else v.strip()):
+        _bad(i, "EMPTY_TEXT", f"{what} must be a non-empty string")
+    return v
+
+
+def _parse_cond(i, c, what: str) -> dict:
+    if not isinstance(c, dict):
+        _bad(i, "BAD_CONDITION", f"{what} must be an object with exactly one of "
+             + ", ".join(_COND_KINDS))
+    kinds = [k for k in c if k in _COND_KINDS]
+    if len(kinds) != 1:
+        _bad(i, "BAD_CONDITION", f"{what} needs exactly one of " + ", ".join(_COND_KINDS))
+    kind = kinds[0]
+    allowed = {kind}
+    if kind in ("ocr", "changed", "stable"):
+        allowed.add("region")
+    if kind == "changed":
+        allowed.add("min_fraction")
+    for k in c:
+        if k not in allowed:
+            _bad(i, "UNKNOWN_KEY", f"{what} has the key {k!r}, which {kind!r} does not take")
+    cond = {"kind": kind, "text": None, "region": None, "min_fraction": 0.005, "secs": 0.0}
+    v = c[kind]
+    if kind == "changed":
+        if v is not True:
+            _bad(i, "BAD_CONDITION", "changed takes true")
+    elif kind == "stable":
+        if not _is_num(v) or not 0.1 <= v <= MAX_TIMEOUT:
+            _bad(i, "BAD_CONDITION", f"stable takes seconds from 0.1 to {MAX_TIMEOUT:g}")
+        cond["secs"] = float(v)
+    else:
+        cond["text"] = _text_field(i, v, f"{what} {kind}")
+    if "region" in c:
+        cond["region"] = _plan_region(i, c["region"], f"{what} region")
+    if "min_fraction" in c:
+        f = c["min_fraction"]
+        if not _is_num(f) or not 0 < f < 1:
+            _bad(i, "BAD_CONDITION", "min_fraction must be a number above 0 and below 1")
+        cond["min_fraction"] = float(f)
+    return cond
+
+
+def _default_timeout(cond: dict) -> float:
+    # A stable wait of N seconds needs N seconds before it can possibly pass.
+    return cond["secs"] + DEFAULT_TIMEOUT if cond["kind"] == "stable" else DEFAULT_TIMEOUT
+
+
+def _parse_step(i: int, s) -> dict:
+    if not isinstance(s, dict):
+        _bad(i, "BAD_STEP", "a step must be a JSON object")
+    acts = [k for k in s if k in _ACTIONS]
+    if len(acts) > 1:
+        _bad(i, "BAD_STEP", "a step has exactly one action key, got " + ", ".join(acts))
+    if not acts:
+        unknown = [k for k in s if k not in ("expect", "timeout")]
+        _bad(i, "UNKNOWN_KEY" if unknown else "BAD_STEP",
+             f"unknown key {unknown[0]!r}" if unknown else "a step needs an action key")
+    action = acts[0]
+    allowed = {action, "expect", "timeout"} | set(_ACTION_OPTS.get(action, ()))
+    for k in s:
+        if k not in allowed:
+            _bad(i, "UNKNOWN_KEY", f"the key {k!r} is not valid on a {action!r} step")
+    v = s[action]
+    opts: dict = {}
+    payload = None
+    if action == "focus":
+        if v is not True:
+            _bad(i, "BAD_STEP", "focus takes true")
+    elif action == "key":
+        _text_field(i, v, "key")
+        try:
+            codes = parse_chord(v)
+        except BadKey as e:
+            _bad(i, "BAD_KEY", f"unknown key {e.args[0]!r} in {v!r}")
+        if not codes:
+            _bad(i, "BAD_KEY", f"{v!r} names no key")
+    elif action in ("type", "paste"):
+        _text_field(i, v, action, payload=True)
+        if action == "type" and ("\n" in v or "\r" in v):
+            _bad(i, "NEWLINE_IN_TYPE", "type refuses a newline (it can submit); use paste")
+        if action == "type" and control_char(v) is not None:
+            _bad(i, "CONTROL_IN_TYPE", "type refuses control characters other than TAB; use key")
+        payload = v
+    elif action == "paste_file":
+        _text_field(i, v, "paste_file")
+        try:
+            with open(v, encoding="utf-8") as f:
+                payload = f.read()
+        except (OSError, ValueError) as e:
+            _bad(i, "BAD_FILE", f"cannot read {v!r} as UTF-8 text ({type(e).__name__})")
+        if not payload:
+            _bad(i, "EMPTY_TEXT", f"{v!r} is empty")
+    elif action == "click":
+        if not isinstance(v, (list, tuple)) or len(v) != 2 or not all(_is_int(n) for n in v):
+            _bad(i, "BAD_STEP", "click takes [x, y] integers")
+        v = tuple(v)
+        if "button" in s:
+            if s["button"] not in ("left", "right"):
+                _bad(i, "BAD_STEP", 'button must be "left" or "right"')
+            opts["button"] = s["button"]
+        if "double" in s:
+            if not isinstance(s["double"], bool):
+                _bad(i, "BAD_STEP", "double must be true or false")
+            opts["double"] = s["double"]
+    elif action == "click_uia":
+        if (not isinstance(v, dict) or set(v) - {"name", "control"} or "name" not in v):
+            _bad(i, "BAD_STEP", 'click_uia takes {"name": str, "control": str (optional)}')
+        _text_field(i, v["name"], "click_uia name")
+        if "control" in v:
+            _text_field(i, v["control"], "click_uia control")
+    elif action == "scroll":
+        if not _is_int(v) or v == 0:
+            _bad(i, "BAD_STEP", "scroll takes a non-zero integer")
+    elif action == "sleep":
+        if not _is_num(v) or not 0 < v <= SLEEP_MAX:
+            _bad(i, "BAD_STEP", f"sleep takes seconds above 0 and at most {SLEEP_MAX:g}; prefer wait")
+        v = float(v)
+    elif action == "shot":
+        _text_field(i, v, "shot")
+        if "no_focus" in s:
+            if not isinstance(s["no_focus"], bool):
+                _bad(i, "BAD_STEP", "no_focus must be true or false")
+            opts["no_focus"] = s["no_focus"]
+        if "max_width" in s:
+            if not _is_int(s["max_width"]) or s["max_width"] < 0:
+                _bad(i, "BAD_STEP", "max_width must be an integer of 0 or more")
+            opts["max_width"] = s["max_width"]
+        if "region" in s:
+            opts["region"] = _plan_region(i, s["region"], "shot region")
+        if "settle" in s:
+            if not _is_num(s["settle"]) or not 0 <= s["settle"] <= 2:
+                _bad(i, "BAD_STEP", "settle must be seconds from 0 to 2")
+            opts["settle"] = float(s["settle"])
+    elif action == "wait":
+        v = _parse_cond(i, v, "wait")
+    expect = None
+    if "expect" in s:
+        if action in ("wait", "sleep", "shot"):
+            _bad(i, "BAD_STEP", f"a {action!r} step takes no expect")
+        expect = _parse_cond(i, s["expect"], "expect")
+    timeout = None
+    if "timeout" in s:
+        if expect is None and action != "wait":
+            _bad(i, "UNKNOWN_KEY", "timeout needs an expect (or a wait step)")
+        t = s["timeout"]
+        if not _is_num(t) or not 0 < t <= MAX_TIMEOUT:
+            _bad(i, "BAD_TIMEOUT", f"timeout must be seconds above 0 and at most {MAX_TIMEOUT:g}")
+        timeout = float(t)
+    cond = v if action == "wait" else expect
+    if cond is not None:
+        if timeout is None:
+            timeout = _default_timeout(cond)
+        elif cond["kind"] == "stable" and timeout < cond["secs"]:
+            _bad(i, "BAD_TIMEOUT", f"timeout {timeout:g} s is shorter than the stable time "
+                 f"{cond['secs']:g} s")
+    return {"i": i, "action": action, "value": v, "opts": opts, "expect": expect,
+            "timeout": timeout, "payload": payload}
+
+
+def parse_plan(text: str) -> list:
+    import json
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        raise PlanError(None, f"BAD_JSON: {e}")
+    if not isinstance(raw, list) or not raw:
+        raise PlanError(None, "BAD_PLAN: the plan must be a non-empty JSON array of steps")
+    if len(raw) > MAX_STEPS:
+        raise PlanError(None, f"TOO_MANY_STEPS: {len(raw)} steps; the limit is {MAX_STEPS}")
+    return [_parse_step(i, s) for i, s in enumerate(raw, 1)]
+
+
+def _look_cost(kind: str, t: float) -> float:
+    """Seconds one pre-send look of this kind may take when it is given `t` (what _tmo hands
+    it: the step's timeout or 2.0, never under 0.3): a UIA call t + 0.3 s, an OCR read
+    max(0.5, t) + 0.25 s, a title read nothing worth funding."""
+    t = max(0.3, t)
+    if kind == "uia":
+        return t + 0.3
+    if kind == "ocr":
+        return max(0.5, t) + 0.25
+    return 0.0
+
+
+_POLL_TAIL = {"uia": 0.3 + 0.3, "ocr": 0.5 + 0.25}   # floor + grace of a read cut to 0.3 s by _tmo
+
+
+def _step_cost(st: dict) -> float:
+    """Seconds one step may take: the ONE figure behind both the printed cap (plan_cap)
+    and the run deadline (a step is not started when it no longer fits). Expect/wait
+    timeout + sleep + typing + 1.5 s for a focus or a sending step; a focusing shot
+    costs its settle (a maximum) + 0.5 s of capture, a no_focus shot 1.0 s. A step that
+    looks before it sends (the expect's pre-check, the read-back waits check_plan recorded
+    in pre_waits, the find + hit_test of click_uia) also pays for those looks."""
+    a = st["action"]
+    if a == "sleep":
+        return st["value"]
+    total = 0.0
+    if st["expect"] is not None or a == "wait":
+        total += st["timeout"]
+        # the poll's last UIA/OCR read may start just before the timeout; _tmo cuts it to
+        # what is left, so it overruns by at most its floor and grace
+        kind = (st["value"] if a == "wait" else st["expect"])["kind"]
+        total += _POLL_TAIL.get(kind, 0.0)
+    if a == "type":
+        total += len(st["value"]) * 0.012
+    if a == "focus" or a in _SEND_ACTIONS:
+        total += 1.5
+    if a == "shot":
+        total += 1.0 if st["opts"].get("no_focus") else st["opts"].get("settle", 1.0) + 0.5
+    if a != "wait":
+        t = st["timeout"] or 2.0
+        if st["expect"] is not None:
+            total += _look_cost(st["expect"]["kind"], t)
+        for wc in st.get("pre_waits") or ():
+            total += _look_cost(wc["kind"], t)
+        if a == "click_uia":
+            total += 2 * _look_cost("uia", t)
+    return total
+
+
+def plan_cap(steps: list) -> float:
+    """Worst-case seconds of the whole plan: the sum of _step_cost."""
+    return sum(_step_cost(st) for st in steps)
+
+
+def _is_enter(chord: str) -> bool:
+    """Enter, or the control chords a terminal reads as Enter (ctrl+m is CR, ctrl+j is LF,
+    ctrl+o is readline's accept-line-and-get-next in bash)."""
+    parts = chord_parts(chord)
+    return any(p in ("enter", "return") for p in parts) or \
+        ("ctrl" in parts and any(p in ("m", "j", "o") for p in parts))
+
+
+_UNKNOWN_CHAR = "\x00"          # a character a shift chord types: which one depends on the layout
+
+
+def _key_text(st: dict):
+    """The text a `key` step types, else None: a chord with a printable key (a-z, 0-9, an OEM
+    punctuation key, space) and no ctrl/alt/win types those keys, in order ('r+m' types
+    'rm'). Under shift the character is unknown (_UNKNOWN_CHAR: no read-back text can be
+    part of it, and it counts as a possible '/'). Such a step is text for the Enter check."""
+    if st["action"] != "key":
+        return None
+    parts = chord_parts(st["value"])
+    if any(p in ("ctrl", "alt", "win") for p in parts):
+        return None
+    out = []
+    for p in parts:
+        code = parse_chord(p)[0]
+        if 0x30 <= code <= 0x39 or 0x41 <= code <= 0x5A:
+            out.append(chr(code).lower())
+        elif code == 0x20:
+            out.append(" ")
+        elif code in _OEM_CHAR:
+            out.append(_OEM_CHAR[code])
+    if not out:
+        return None
+    return _UNKNOWN_CHAR * len(out) if "shift" in parts else "".join(out)
+
+
+def _text_of(st: dict):
+    """The text a step puts into the focused field (type, paste, paste_file, a typing chord), else None."""
+    if st["action"] in ("type", "paste", "paste_file"):
+        return st["payload"]
+    return _key_text(st)
+
+
+def _ocr_ready() -> tuple:
+    try:
+        return _lazy_module("ocr").available()
+    except Exception as e:                                   # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+
+
+def check_plan(steps: list, has_target: bool) -> float:
+    """Whole-plan rules; returns the cap. Raises PlanError. Sends nothing."""
+    if not has_target:
+        for st in steps:
+            ok = st["action"] == "sleep" or (st["action"] == "wait"
+                                             and st["value"]["kind"] in _WINDOW_KINDS)
+            if not ok:
+                raise PlanError(st["i"], "NO_TARGET: this step needs a target window; pass "
+                                "--title or --id (only wait window / window_gone and sleep "
+                                "run without one)")
+    clean = True            # every earlier step is a focus or a no_focus shot
+    for st in steps:
+        if st["action"] == "click":
+            if not clean:
+                raise PlanError(st["i"], "STALE_CLICK: a coordinate click is valid only when "
+                                "every earlier step is a focus or a no_focus shot; read a "
+                                "fresh screenshot and put the click in its own run")
+        if not (st["action"] == "focus" or (st["action"] == "shot" and st["opts"].get("no_focus"))):
+            clean = False
+    for n, st in enumerate(steps):
+        if st["action"] != "key" or not _is_enter(st["value"]):
+            continue
+        if _key_text(st) is not None:
+            # One step that types and submits ('l+s+enter'): nothing can read the text back.
+            raise PlanError(st["i"], "ENTER_UNVERIFIED: a chord that types a key and presses Enter "
+                            "in one step cannot be read back; type the text first, verify it, "
+                            "then send Enter as its own step")
+        # Walk back to the text this Enter would submit: a type/paste/paste_file, or a run
+        # of adjacent typing `key` steps (they type, so they are text too).
+        # Steps that send no text (a key without Enter, a scroll, a click) do not reset
+        # the check. The verified points are an expect ON the text step, or a uia/ocr `wait`
+        # after it, whose text is part of the payload; an expect on a step between is
+        # pre-checked after the text landed (it could only fail) and a decoy proves nothing.
+        k, seen = n - 1, []
+        while k >= 0:
+            p = steps[k]
+            if _text_of(p) is not None:
+                break
+            c = p["value"] if p["action"] == "wait" else None
+            if c is not None and c["kind"] in ("uia", "ocr"):
+                seen.append(c)
+            k -= 1
+        if k < 0:
+            continue
+        first = k
+        if steps[k]["action"] == "key":
+            while first > 0 and steps[first - 1]["action"] == "key" and _key_text(steps[first - 1]) is not None:
+                first -= 1
+            run = steps[first:k + 1]
+            payload = "".join(_key_text(s) for s in run)
+        else:
+            run, payload = [steps[k]], steps[k]["payload"]
+        own = [s["expect"] for s in run if s["expect"] and s["expect"]["kind"] in ("uia", "ocr")
+               and s["expect"]["text"] and s["expect"]["text"] in payload]
+        waits = [c for c in seen if c["text"] and c["text"] in payload]
+        if not own and not waits:
+            raise PlanError(st["i"], "ENTER_UNVERIFIED: Enter after type/paste needs that step to "
+                            "carry an expect of kind uia or ocr whose text is part of what it "
+                            "typed (or a uia/ocr wait after it); otherwise put Enter in a "
+                            "separate run after reading a screenshot")
+        if not own:
+            # The read-back is a wait: it counts only if it was NOT already true before the
+            # text was sent, so the run checks it before the text's first step sends.
+            have = run[0].setdefault("pre_waits", [])
+            have.extend(c for c in waits if not any(c is h for h in have))
+        # The command menu opens on a '/' that STARTS the input: join every adjacent text step
+        # back to the first one (an earlier Enter ends the input); an unknown char may be '/'.
+        joined = [_text_of(steps[k])]
+        j = k - 1
+        while j >= 0 and not (steps[j]["action"] == "key" and _is_enter(steps[j]["value"])):
+            t = _text_of(steps[j])
+            if t is not None:
+                joined.append(t)
+            j -= 1
+        if "".join(reversed(joined)).startswith(("/", _UNKNOWN_CHAR)):
+            between = steps[k + 1:n]
+            if not any((b["action"] == "sleep" and b["value"] >= 3.0)
+                       or (b["action"] == "wait" and b["value"]["kind"] == "stable"
+                           and b["value"]["secs"] >= 3.0) for b in between):
+                raise PlanError(st["i"], "SLASH_WAIT: text starting with / (or with a shifted key, "
+                                "which may be /) needs a sleep or a wait stable of at least 3.0 s between it and Enter (the "
+                                "command menu opens late)")
+    for st in steps:
+        conds = [c for c in (st["expect"], st["value"] if st["action"] == "wait" else None) if c]
+        if any(c["kind"] == "ocr" for c in conds):
+            ok, why = _ocr_ready()
+            if not ok:
+                raise PlanError(st["i"], f"OCR_UNAVAILABLE: {why}")
+    cap = plan_cap(steps)
+    if cap > RUN_CAP:
+        raise PlanError(None, f"RUN_TOO_LONG: worst case {cap:.0f} s is over the {RUN_CAP:.0f} s "
+                        "limit; split the plan")
+    return cap
+
+
+# --- the run lock: one sending run at a time -----------------------------------
+
+def _lock_path() -> str:
+    return os.path.join(STATE_DIR, "run.lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    kernel32.OpenProcess.argtypes = [DWORD, BOOL, DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = kernel32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ctypes.get_last_error() == 5               # access denied: it exists
+    try:
+        code = DWORD(0)
+        return bool(kernel32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259
+    finally:
+        kernel32.CloseHandle(h)
+
+
+_LOCK_STARTING = -1             # an empty lock file: its creator has not written its pid yet
+LOCK_EMPTY_WAIT = 2.0           # how long an empty lock is waited for before it is a refusal
+
+
+def _judge_lock(p: str):
+    """(exists, holder) for the lock file at `p`: holder is a live pid, _LOCK_STARTING for an
+    empty file younger than RUN_LOCK_STALE (its creator is between O_EXCL and writing its
+    pid: treating it as stale would let two runs send at once), or None when stale (a
+    non-empty lock with a dead or unreadable pid, or any lock older than RUN_LOCK_STALE)."""
+    try:
+        age = time.time() - os.stat(p).st_mtime
+    except OSError:
+        return False, None
+    try:
+        with open(p, encoding="ascii") as f:
+            text = f.read().strip()
+        pid = int(text) if text else _LOCK_STARTING
+    except (OSError, ValueError):
+        pid = 0
+    if pid == _LOCK_STARTING and age < RUN_LOCK_STALE:
+        return True, pid
+    if pid > 0 and age < RUN_LOCK_STALE and _pid_alive(pid):
+        return True, pid
+    return True, None
+
+
+def _lock_holder() -> int | None:
+    """Pid of a live run holding the lock (or _LOCK_STARTING, see _judge_lock); None when
+    there is none. A stale lock is evicted ATOMICALLY: it is renamed to a name only this
+    process knows, then judged again and removed, so two processes that both found the
+    same stale file cannot both delete it (one rename wins); if what was renamed turns out
+    to be a live lock another run put there in between, it is renamed back."""
+    p = _lock_path()
+    exists, holder = _judge_lock(p)
+    if holder is not None or not exists:
+        return holder
+    mine = f"{p}.stale-{os.getpid()}-{time.time_ns()}"
+    try:
+        os.replace(p, mine)
+    except OSError:
+        return None                          # another process evicted or replaced it first
+    exists, holder = _judge_lock(mine)
+    if holder is None:
+        try:
+            os.remove(mine)
+        except OSError:
+            pass
+        return None
+    try:
+        os.rename(mine, p)                   # fails (does not overwrite) when a new lock exists
+    except OSError:
+        try:
+            os.remove(mine)                  # a lock is at p already: this run is refused anyway
+        except OSError:
+            pass
+    return holder
+
+
+def _refuse_if_busy() -> None:
+    t0 = _clock()
+    pid = _lock_holder()
+    while pid == _LOCK_STARTING and _clock() - t0 < LOCK_EMPTY_WAIT:     # a run is starting
+        _sleep(0.05)
+        pid = _lock_holder()
+    if pid and pid != os.getpid():
+        who = f"pid {pid}" if pid > 0 else "starting up"
+        die("BUSY", f"a run ({who}) is sending input",
+            ["Wait for it to finish (RUN_OK / RUN_FAILED / RUN_STOPPED) before sending anything."])
+
+
+def _acquire_run_lock() -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    for _ in range(3):
+        _refuse_if_busy()
+        if _lock_holder() == os.getpid():
+            return
+        try:
+            fd = os.open(_lock_path(), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+        return
+    die("BUSY", "could not take the run lock")
+
+
+def _release_run_lock() -> None:
+    try:
+        with open(_lock_path(), encoding="ascii") as f:
+            mine = f.read().strip() == str(os.getpid())
+        if mine:
+            os.remove(_lock_path())
+    except OSError:
+        pass
+
+
+# --- reading the target: frames and conditions ----------------------------------
+
+class _Run:
+    """State of one run: the one target window, the window snapshot, the last matched window."""
+
+    def __init__(self, win, snap):
+        self.win = win
+        self.hwnd = win.hwnd if win else None
+        self.hid = win.id if win else None
+        self.snap = snap
+        self.matched = None
+        self.deadline = None        # absolute _clock() time the run must be over by (the printed cap)
+        self.step_tmo = None        # the running step's own timeout, if it has one
+        self.poll_end = None        # absolute _clock() time the running poll ends, while polling
+
+
+def _tmo(ctx: _Run) -> float:
+    """timeout_s for a UI Automation / OCR call inside a step: the step's own timeout
+    (2 s when it has none), cut to the time left in the run and, inside a poll, to the time
+    left in the poll, never under 0.3 s."""
+    t = ctx.step_tmo or 2.0
+    if ctx.deadline is not None:
+        t = min(t, ctx.deadline - _clock())
+    if ctx.poll_end is not None:
+        t = min(t, ctx.poll_end - _clock())
+    return max(0.3, t)
+
+
+def _win_of(hwnd: int):
+    """The window with this handle as a fresh Win (None when it is gone)."""
+    if not _is_window(hwnd):
+        return None
+    r = _rect_of(hwnd)
+    if r is None:
+        return None
+    return Win(str(hwnd), _title_of(hwnd), r[0], r[1], r[2] - r[0], r[3] - r[1])
+
+
+def _read_frame(ctx: _Run, region):
+    win = _win_of(ctx.hwnd)
+    if win is None:
+        die("NO_SUCH_ID", f"window {ctx.hid} is gone.", ["Handles change when a window is closed and reopened."])
+    if win.minimized:
+        raise _ExpectFailed("the window is minimized; nothing renders to read")
+    return grab_bgra(win, region, 0)
+
+
+def frame_sig(w: int, h: int, bgra: bytes, step: int = 8) -> tuple:
+    """Every 8th pixel in x and y of a BGRA frame, as one bytes object per sampled row."""
+    mv = memoryview(bgra).cast("I")
+    return (w, h, [mv[y * w:(y + 1) * w:step].tobytes() for y in range(0, h, step)])
+
+
+def sig_diff(a: tuple, b: tuple) -> float:
+    """Fraction of sampled pixels whose color differs (alpha ignored); 1.0 if the size changed."""
+    if a[:2] != b[:2]:
+        return 1.0
+    total = diff = 0
+    for ra, rb in zip(a[2], b[2]):
+        n = len(ra) // 4
+        total += n
+        if ra != rb:
+            ua, ub = struct.unpack(f"<{n}I", ra), struct.unpack(f"<{n}I", rb)
+            diff += sum(1 for p, q in zip(ua, ub) if (p ^ q) & 0xFFFFFF)
+    return diff / total if total else 0.0
+
+
+def _quote(cond: dict) -> str:
+    if cond["kind"] == "stable":
+        return f"stable {cond['secs']:g}"
+    if cond["text"] is not None:
+        return f'{cond["kind"]} "{cond["text"]}"'
+    return cond["kind"]
+
+
+def _cond_check(ctx: _Run, cond: dict, state: dict) -> tuple:
+    """One look at a condition: (true now, why not). `state` carries baselines between looks."""
+    k, text = cond["kind"], cond["text"]
+    if k == "title":
+        t = _title_of(ctx.hwnd)
+        return text.lower() in t.lower(), f'the title is "{t}", which does not contain "{text}"'
+    if k in _WINDOW_KINDS:
+        hits = [w for w in list_windows() if text.lower() in w.title.lower()]
+        if k == "window_gone":
+            return not hits, f'a visible window title still contains "{text}"'
+        hits = [w for w in hits if w.id not in (ctx.snap or ())]
+        if len(hits) > 1:
+            die("AMBIGUOUS", f"{len(hits)} windows that did not exist when the run started match "
+                f"{text!r}. Refusing.", ["CANDIDATE: " + w.line() for w in hits[:10]], indent="")
+        if hits:
+            ctx.matched = hits[0]
+            return True, ""
+        return False, f'no window opened since the run started has a title containing "{text}"'
+    if k == "uia":
+        uia = _lazy_module("uia")
+        try:
+            found, truncated = uia.find(ctx.hwnd, text, timeout_s=_tmo(ctx))
+        except uia.Unavailable as e:
+            raise _ExpectFailed(f"UI Automation unavailable: {e}")
+        state["truncated"] = truncated
+        return bool(found), (f'no element contains "{text}"'
+                             + (" (the UI Automation tree was cut short)" if truncated else ""))
+    if k == "ocr":
+        ocr = _lazy_module("ocr")
+        w, h, bgra = _read_frame(ctx, cond["region"])
+        try:
+            lines = ocr.recognize_bgra(w, h, bgra, timeout_s=_tmo(ctx))
+        except (ocr.Unavailable, ValueError) as e:
+            raise _ExpectFailed(f"OCR failed: {e}")
+        got = " ".join(ocr.text_of(lines).split()).lower()
+        return " ".join(text.split()).lower() in got, f'the OCR text does not contain "{text}"'
+    w, h, bgra = _read_frame(ctx, cond["region"])
+    sig = frame_sig(w, h, bgra)
+    if k == "changed":
+        if state.get("base") is None:
+            state["base"] = sig                  # a `wait` takes its baseline at its first look
+            return False, "the window has not changed"
+        d = sig_diff(sig, state["base"])
+        return d > cond["min_fraction"], (f"the window changed by {d * 100:.2f}% of sampled "
+                                          f"pixels; needs more than {cond['min_fraction'] * 100:.2f}%")
+    # stable: identical samples, held for cond["secs"]
+    now = _clock()
+    if state.get("last") is None or sig_diff(sig, state["last"]) > 0:
+        state["last"], state["since"] = sig, now
+        return False, "the window kept changing"
+    return now - state["since"] >= cond["secs"], "the window kept changing"
+
+
+def _poll(ctx: _Run, cond: dict, timeout: float, state: dict) -> tuple:
+    """Look every 100 ms (OCR 300 ms) until true or `timeout`: (ok, why not, seconds)."""
+    t0 = _clock()
+    interval = 0.3 if cond["kind"] == "ocr" else 0.1
+    ctx.poll_end = t0 + timeout     # a read started late gets only what is left (_tmo)
+    try:
+        while True:
+            ok, why = _cond_check(ctx, cond, state)
+            elapsed = _clock() - t0
+            if ok:
+                return True, "", elapsed
+            if elapsed >= timeout:
+                return False, why, elapsed
+            _sleep(max(0.0, min(interval, timeout - elapsed)))
+    finally:
+        ctx.poll_end = None
+
+
+# --- one step ------------------------------------------------------------------
+
+def _step_ns(ctx: _Run, **kw):
+    import types
+    return types.SimpleNamespace(title=None, id=ctx.hid, unlock=False, quiet=True, **kw)
+
+
+def _do_action(ctx: _Run, st: dict) -> None:
+    a, v, o = st["action"], st["value"], st["opts"]
+    if a == "key":
+        act_key(_step_ns(ctx, keys=v, delay=st["expect"] is None))     # an expect replaces the 0.3 s
+    elif a == "type":
+        act_type(_step_ns(ctx, text=v))
+    elif a in ("paste", "paste_file"):
+        act_paste(_step_ns(ctx, text=st["payload"], file=None, keep_clipboard=False))
+    elif a == "click":
+        act_click(_step_ns(ctx, x=v[0], y=v[1], right=o.get("button") == "right",
+                           double=bool(o.get("double"))))
+    elif a == "click_uia":
+        act_click_uia(_step_ns(ctx, name=v["name"], control=v.get("control"),
+                               right=False, double=False, timeout_s=_tmo(ctx)))
+    elif a == "scroll":
+        act_scroll(_step_ns(ctx, amount=v))
+    elif a == "shot":
+        act_shot(_step_ns(ctx, out=v, no_focus=bool(o.get("no_focus")),
+                          max_width=o.get("max_width", 1280), region=o.get("region"),
+                          settle=o.get("settle", 1.0)))
+
+
+def _precheck(ctx: _Run, cond: dict, what: str) -> None:
+    """Look at a condition BEFORE the step sends: true already proves nothing, and a cut-short
+    UIA read cannot say it is absent. Raises _ExpectFailed with sent=False."""
+    pre: dict = {}
+    try:
+        already, _ = _cond_check(ctx, cond, pre)
+    except _ExpectFailed as e:
+        e.sent, e.kind = False, cond["kind"]
+        raise
+    if already:
+        raise _ExpectFailed(f"EXPECT_ALREADY_TRUE: {what} was true before the step "
+                            "sent anything, so it proves nothing; nothing was sent for "
+                            "this step. Rewrite " + ("the expect." if what == "the expect"
+                                                     else "the plan so the text is absent first."),
+                            sent=False, kind=cond["kind"])
+    if pre.get("truncated"):
+        raise _ExpectFailed("EXPECT_UNPROVABLE: the UI Automation tree was cut short before "
+                            f"the step, so 'not there yet' cannot be trusted and {what} "
+                            "could pass on text that was already on screen; nothing was "
+                            "sent for this step. Use a smaller target or an ocr expect.",
+                            sent=False, kind=cond["kind"])
+
+
+def _exec_step(ctx: _Run, st: dict) -> dict:
+    """Run one step: focus, pre-check, baseline, act, expect. Prints into the caller's
+    capture. Raises _ExpectFailed for a failed or void expect, SystemExit via die()."""
+    a, ex = st["action"], st["expect"]
+    res = {"act_secs": 0.0, "expect_secs": None, "cond": None}
+    ctx.step_tmo = st["timeout"]
+    t0 = _clock()
+    if a == "sleep":
+        _sleep(st["value"])
+        res["act_secs"] = _clock() - t0
+        return res
+    cond = st["value"] if a == "wait" else None
+    if ctx.hwnd is not None and (a != "wait" or cond["kind"] in _TARGET_KINDS):
+        if not _is_window(ctx.hwnd):
+            die("NO_SUCH_ID", f"window {ctx.hid} is gone.",
+                ["Handles change when a window is closed and reopened."])
+    if a == "wait":
+        ok, why, secs = _poll(ctx, cond, st["timeout"], {})
+        res.update(act_secs=secs, cond=cond)
+        if not ok:
+            raise _ExpectFailed(f"{why} after {st['timeout']:.1f} s")
+        return res
+    if a == "focus" or a in _SEND_ACTIONS:
+        ctx.win = focus(None, wid=ctx.hid, unlock=False)
+    state: dict = {}
+    for wc in st.get("pre_waits") or ():          # a later wait is this text's read-back (check_plan)
+        _precheck(ctx, wc, "the read-back wait " + _quote(wc))
+    if ex is not None:
+        if ex["kind"] in ("title", "uia", "ocr"):
+            _precheck(ctx, ex, "the expect")
+        elif ex["kind"] == "changed":
+            w, h, bgra = _read_frame(ctx, ex["region"])
+            state["base"] = frame_sig(w, h, bgra)
+    if a != "focus":
+        _do_action(ctx, st)
+    res["act_secs"] = _clock() - t0
+    if ex is not None:
+        ok, why, secs = _poll(ctx, ex, st["timeout"], state)
+        res.update(expect_secs=secs, cond=ex)
+        if not ok:
+            raise _ExpectFailed(f"{why} after {st['timeout']:.1f} s")
+    return res
+
+
+def _desc(st: dict) -> str:
+    a, v, o = st["action"], st["value"], st["opts"]
+    if a == "key":
+        return f"key {v}"
+    if a == "click":
+        return f"click {v[0]},{v[1]}" + (" double" if o.get("double") else "") + \
+            (" right" if o.get("button") == "right" else "")
+    if a == "click_uia":
+        return f'click_uia "{v["name"]}"'
+    if a == "scroll":
+        return f"scroll {v}"
+    if a == "shot":
+        return f"shot {v}"
+    if a == "wait":
+        return f"wait {_quote(v)}"
+    if a == "sleep":
+        return f"sleep {v:g}"
+    return a
+
+
+def _log_desc(st: dict) -> str:
+    """_desc for actions.log: a uia/ocr wait is often the read-back of typed text, so it logs
+    the text's length only, as TYPE and PASTE log a count."""
+    v = st["value"]
+    if st["action"] == "wait" and v["kind"] in ("uia", "ocr") and v.get("text") is not None:
+        return f'wait {v["kind"]} ({len(v["text"])} chars)'
+    return _desc(st)
+
+
+def _join_lines(text: str) -> list:
+    out: list = []
+    for ln in text.splitlines():
+        if ln.strip() and (not out or out[-1] != ln.strip()):      # run's pre-focus and the act's repeat
+            out.append(ln.strip())
+    return out
+
+
+def _fail_shot(ctx: _Run, path: str) -> None:
+    """The window's own content (PrintWindow, never a screen grab), without re-focusing."""
+    import contextlib
+    import io
+    if ctx.hwnd is None:
+        print("FAIL_SHOT: skipped (this run has no target window)")
+        return
+    win = _win_of(ctx.hwnd)
+    if win is None:
+        print("FAIL_SHOT: skipped (the window is gone)")
+        return
+    if win.minimized:
+        print("FAIL_SHOT: skipped (the window is minimized)")
+        return
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            act_shot(_step_ns(ctx, out=path, no_focus=True, max_width=1280, region=None, settle=0))
+    except SystemExit:
+        first = buf.getvalue().strip().splitlines()[:1]
+        print(f"FAIL_SHOT: skipped ({first[0] if first else 'capture refused'})")
+        return
+    warn = False
+    for ln in buf.getvalue().splitlines():
+        if ln.startswith("SHOT: "):
+            print("FAIL_SHOT: " + ln[6:].replace("  (no focus change)", ""))
+        elif ln.startswith("WINDOW_ORIGIN:"):
+            print(ln)
+        elif ln.startswith("WARNING"):
+            warn = True
+            print(ln)
+        elif warn and ln.startswith("  "):
+            print(ln)
+        elif ln.startswith("To click"):
+            warn = False
+
+
+def run_plan(a) -> int:
+    """`screenctl.py run`: returns the exit code. Output contract: SKILL.md / the module doc."""
+    import contextlib
+    import io
+    if bool(a.plan) == bool(a.plan_file):
+        die("NO_PLAN", "run needs exactly one of --plan or --plan-file")
+    text = a.plan
+    if a.plan_file:
+        try:
+            with open(a.plan_file, encoding="utf-8-sig") as f:
+                text = f.read()
+        except (OSError, ValueError) as e:
+            print(f"PLAN_INVALID: step -: BAD_FILE: cannot read the plan file ({type(e).__name__})")
+            return 1
+    has_target = bool(a.title or a.id)
+    try:
+        steps = parse_plan(text)
+        cap = check_plan(steps, has_target)
+    except PlanError as e:
+        print(f"PLAN_INVALID: step {e.step if e.step else '-'}: {e}")
+        log(f"PLAN_INVALID step={e.step}: {e}")
+        return 1
+    n = len(steps)
+    win = resolve(a.title, a.id) if has_target else None            # NOT_FOUND / AMBIGUOUS refuse here
+    head = (f"RUN: {n} steps, target {win.line()}, cap {cap:.1f} s" if win
+            else f"RUN: {n} steps, no target (waits only), cap {cap:.1f} s")
+    if a.dry_run:
+        print(head)
+        for st in steps:
+            print(f"STEP {st['i']}/{n} {_desc(st)}"
+                  + (f" | expect {_quote(st['expect'])} within {st['timeout']:g} s" if st["expect"] else ""))
+        print("DRY_RUN_OK: validated; nothing was focused, sent or captured")
+        return 0
+    uses_window = any(c and c["kind"] in _WINDOW_KINDS for st in steps
+                      for c in (st["expect"], st["value"] if st["action"] == "wait" else None))
+    snap = {w.id for w in list_windows()} if uses_window else None
+    ctx = _Run(win, snap)
+    fail_path = a.fail_shot or os.path.join(STATE_DIR, "run", f"fail-{os.getpid()}.png")
+    _acquire_run_lock()                       # BUSY here means another run is sending: no RUN line
+    print(head)
+    t_run = _clock()
+    ctx.deadline = t_run + cap                # the printed cap IS the run deadline
+    log(f"RUN start {n} steps target={win.title!r}" if win else f"RUN start {n} steps no target")
+    try:
+        for st in steps:
+            i = st["i"]
+            need = _step_cost(st)
+            left = ctx.deadline - _clock()
+            if need > left + DEADLINE_GRACE:  # not started: nothing of this step was sent
+                print(f"DEADLINE: step {i} may need {need:.1f} s and {max(0.0, left):.1f} s of the "
+                      f"{cap:.1f} s cap are left. It was not sent.")
+                print(f"RUN_STOPPED DEADLINE step={i}/{n}")
+                _fail_shot(ctx, fail_path)
+                print(f"NOT_RUN: steps {i}-{n}")
+                log(f"RUN end deadline before step {i}/{n}")
+                return 1
+            buf = io.StringIO()
+            outcome, res, err = "ok", None, None
+            try:
+                with contextlib.redirect_stdout(buf):
+                    res = _exec_step(ctx, st)
+            except SystemExit:
+                outcome = "stopped"
+            except _ExpectFailed as e:
+                outcome, err = "failed", e
+            except Exception as e:                                  # noqa: BLE001
+                import traceback
+                outcome, err = "internal", e
+                log("FAIL INTERNAL_ERROR: " + traceback.format_exc().rstrip().replace("\n", " | "))
+            lines = _join_lines(buf.getvalue())
+            d = _desc(st)
+            if outcome == "ok":
+                secs = f"({res['act_secs']:.2f} s)"
+                if st["action"] == "shot":
+                    print(f"STEP {i}/{n} OK {d} {secs}")
+                    for ln in buf.getvalue().splitlines():
+                        print(ln)
+                else:
+                    parts = [f"STEP {i}/{n} OK {d} {secs}"] + lines
+                    if res["expect_secs"] is not None and st["action"] != "wait":
+                        parts.append(f"expect {_quote(res['cond'])} ok ({res['expect_secs']:.2f} s)")
+                    print(" | ".join(parts))
+                if res["cond"] and res["cond"]["kind"] == "window" and ctx.matched:
+                    print("WINDOW: " + ctx.matched.line())
+                log(f"RUN_STEP {i}/{n} OK {_log_desc(st)}")
+                continue
+            if outcome == "failed":
+                if err.sent and st["action"] not in ("wait", "sleep"):
+                    print(" | ".join([f"STEP {i}/{n} SENT {d}"] + lines))
+                cond = st["value"] if st["action"] == "wait" else st["expect"]
+                kind = err.kind or (cond["kind"] if cond else "?")
+                print(f"RUN_FAILED step={i}/{n} action={st['action']} expect={kind}: {err}")
+            elif outcome == "stopped":
+                text_out = buf.getvalue().rstrip("\n")
+                if text_out:
+                    print(text_out)
+                print(f"RUN_STOPPED step={i}/{n}")
+            else:
+                if lines:
+                    print(" | ".join(lines))
+                print(f"INTERNAL_ERROR: {type(err).__name__}: {err}")
+                print(f"  The traceback was appended to {LOG}.")
+                print(f"RUN_STOPPED step={i}/{n}")
+            _fail_shot(ctx, fail_path)
+            print(f"NOT_RUN: steps {i + 1}-{n}" if i < n else "NOT_RUN: none")
+            log(f"RUN end {outcome} at step {i}/{n}")
+            return 1
+        print(f"RUN_OK {n} steps in {_clock() - t_run:.2f} s")
+        log(f"RUN end ok {n} steps")
+        return 0
+    finally:
+        _release_run_lock()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("action", choices=["doctor", "list", "find", "focus", "shot",
-                                       "type", "paste", "key", "click", "scroll"])
+                                       "type", "paste", "key", "click", "scroll", "run"])
     ap.add_argument("--title")
     ap.add_argument("--id", help="target a window by handle from `list`, for when a "
                                  "title is ambiguous or the app renames its own window")
@@ -1239,8 +2517,25 @@ def main() -> int:
     ap.add_argument("--right", action="store_true")
     ap.add_argument("--keep-clipboard", action="store_true",
                     help="do not restore the user's clipboard after a paste")
+    ap.add_argument("--region", help="for shot: x,y,w,h in window pixels (relative to the "
+                                     "window's top-left, physical); crop first, then downscale")
+    ap.add_argument("--plan", help="for run: the plan as inline JSON (an array of steps)")
+    ap.add_argument("--plan-file", help="for run: read the plan from a file (long payloads)")
+    ap.add_argument("--fail-shot", help="for run: where the failure screenshot goes "
+                                        "(default <state dir>/run/fail-<pid>.png; the state dir is "
+                                        "~/.claude/screenctl unless SCREENCTL_STATE_DIR is set)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="for run: validate and print the steps; focus, send and capture nothing")
     a = ap.parse_args()
 
+    # A run owns the keyboard and mouse for its whole life: anything else that sends
+    # input or moves focus waits for it (read-only subcommands ignore the lock).
+    if a.action in ("doctor", "focus", "type", "paste", "key", "click", "scroll") or \
+            (a.action == "shot" and not a.no_focus):
+        _refuse_if_busy()
+
+    if a.action == "run":
+        return run_plan(a)
     if a.action == "doctor":
         act_doctor(a)
     elif a.action == "list":
@@ -1263,26 +2558,13 @@ def main() -> int:
     elif a.action == "key":
         if not a.keys:
             die("NO_KEYS", "--keys is required, e.g. enter, esc, ctrl+shift+p")
-        win = focus(a.title, wid=a.id)
-        try:
-            send_chord(a.keys)
-        except InputBlocked as e:
-            _die_input_blocked(e, "The chord was not delivered.")
-        time.sleep(0.3)
-        log(f"KEY {a.keys} into {win.title!r}")
-        print(f"SENT: {a.keys}")
+        act_key(a)
     elif a.action == "click":
         if a.x is None or a.y is None:
             die("NO_COORDS", "--x and --y are required for click")
         act_click(a)
     elif a.action == "scroll":
-        win = focus(a.title, wid=a.id)
-        try:
-            scroll(win, a.amount)
-        except InputBlocked as e:
-            _die_input_blocked(e, "Nothing was scrolled.")
-        log(f"SCROLL {a.amount} in {win.title!r}")
-        print(f"SCROLLED {a.amount}")
+        act_scroll(a)
     return 0
 
 
@@ -1293,6 +2575,7 @@ if __name__ == "__main__":
         # A crash must still fail with a stable first token, and the traceback
         # must survive the caller's output handling (a filtering pipe can drop
         # most frames). The log keeps the whole thing.
+        import traceback
         log("FAIL INTERNAL_ERROR: " + traceback.format_exc().rstrip().replace("\n", " | "))
         die("INTERNAL_ERROR", f"{type(e).__name__}: {e}",
             [f"The full traceback was appended to {LOG}.",

@@ -11,7 +11,10 @@ It takes the keyboard and mouse for about fifteen seconds. Run it only when the
 screen is yours to give; do not type or move the mouse while it runs. Without
 --live it only prints what it would do and exits 2.
 
-  python _smoke_windows.py --live
+  python _smoke_windows.py --live [--at X,Y]
+
+--at places the test window's top-left at screen X,Y (default 120,120 on the primary
+monitor); use it to keep the run on a monitor the user handed over.
 
 The action log goes to a temp folder (SCREENCTL_STATE_DIR) that is removed at the
 end, so the real ~/.claude/screenctl/actions.log is left alone.
@@ -52,7 +55,7 @@ CHILD = r"""
 import sys, tkinter as tk
 root = tk.Tk()
 root.title(sys.argv[1])
-root.geometry("640x400+120+120")
+root.geometry("640x400" + sys.argv[2])
 t = tk.Text(root, font=("Consolas", 14), undo=False)
 t.pack(fill="both", expand=True)
 def select_all(e):
@@ -124,7 +127,12 @@ def run_live() -> int:
             print("aborted; copy some text to the clipboard first")
             return 1
 
-    child = subprocess.Popen([sys.executable, "-c", CHILD, TITLE])
+    at = "120,120"
+    if "--at" in sys.argv:
+        at = sys.argv[sys.argv.index("--at") + 1]
+    x, y = (int(v) for v in at.split(","))
+    # Tk reads "+X+Y" as offsets from the left/top; a negative X is written "+-1200".
+    child = subprocess.Popen([sys.executable, "-c", CHILD, TITLE, f"+{x}+{y}"])
     wid = None
     try:
         for _ in range(60):

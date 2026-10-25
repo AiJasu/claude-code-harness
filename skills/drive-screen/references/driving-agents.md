@@ -12,6 +12,8 @@ VS Code; `tmux` is not used.
 - [Starting a session](#starting-a-session)
 - [Sending a prompt](#sending-a-prompt)
 - [Waiting, and answering prompts](#waiting-and-answering-prompts)
+- [session_watch.py in detail](#session_watchpy-in-detail)
+- [autodrive.py in detail](#autodrivepy-in-detail)
 - [Auditing what the agent actually did](#auditing-what-the-agent-actually-did)
 - [Several sessions at once](#several-sessions-at-once)
 - [Cleaning up](#cleaning-up)
@@ -69,8 +71,8 @@ wt.exe -w new --title "DEMO-1" --suppressApplicationTitle -d "C:/Users/you/proje
 
 Without `--suppressApplicationTitle` the title is overridden by whatever the
 running program sets, and Claude Code sets it repeatedly (its own name, then a
-summary of the current task). Even with it, take the handle from `list` once and
-target by `--id`.
+summary of the current task). Even with it, the app may rename the window: target
+by `--id` from a fresh `list` (re-list after any window close).
 
 **The editor's terminal panel,** when the session must be visible as a real
 working session. Several sessions stay visible at once and the window title is
@@ -97,8 +99,11 @@ dash that may be non-ASCII, and the file part changes with every tab switch.
 Target the project name alone and make it long enough to be unique:
 `myapp`, never `my`. Confirm the exact shape with `list` on the day.
 
-Re-resolve the window before each step. Do not cache a handle across a long run
-unless the title is genuinely unusable (see `--id` in `SKILL.md`).
+Targeting rule (as in `SKILL.md`): list, then a unique title; `--id` from a fresh
+list when the title is ambiguous or the app renames itself (re-list after any window
+close). A single `run` is different: it resolves its target once and holds that
+handle for its own few seconds (at most 30 steps, under the printed cap), checking
+before every step that the window still exists.
 
 ---
 
@@ -224,6 +229,106 @@ Be deliberate about the "don't ask again" option, because it is not one thing. F
 a Bash command it writes a permanent rule into the repository's local settings
 file. For a file edit it lasts only until the session ends. Granting the first kind
 unattended widens permissions past the end of the task.
+
+---
+
+## session_watch.py in detail
+
+```bash
+python ~/.claude/skills/drive-screen/scripts/session_watch.py <cmd> --repo <path-of-the-driven-session>
+```
+
+| Command | Returns |
+|---|---|
+| `dir` | Resolved transcript directory, newest file, subagent transcript count |
+| `sessions` | Every session UUID in this project |
+| `mark` | Record count and completed-turn count: the baseline to diff against |
+| `wait` | Blocks until the turn genuinely ends, then prints the final message |
+| `last` | The final message of the last completed turn, verbatim. Mid-turn narration is not persisted to the transcript (measured on the version tested), so during a turn this shows the previous turn's report or the turn's opening line |
+| `reads --match X` | Every file the agent touched, filtered. Add `--all` for subagents |
+
+`wait` exits 0 when the turn closes, 1 on timeout (the agent is probably still
+working: screenshot, never send keys) and 2 when it goes quiet with the turn
+still open. Exit 2 prints one of two tokens. `RUNNING` means a tool call is
+still executing: a long command, or a dead process. Do not send keys; wait
+again or screenshot. `BLOCKED` means the turn is open and nothing is executing,
+which is what a waiting permission prompt looks like from the transcript, or
+thinking.
+
+The transcript cannot tell you which. Records are flushed asynchronously and the
+flush lags the conversation. Upstream watched a live prompt twice on the same
+version and got two different transcripts: once an unanswered tool_use naming the
+exact command, once nothing at all, with the tool_use appearing only after
+approval. On the version tested the pending Write WAS in the transcript while its
+prompt sat on screen, so the hint is often available; it is still a hint about
+what is being asked, never proof of what state the session is in. Screenshot
+before answering anything.
+
+A completed turn is not a finished task. If the driven agent dispatched a
+subagent, it can close the turn while that work is still running. `wait` has
+returned a completed turn whose entire content was "Explore agent is running,
+I'll report back", with the actual answer two turns later. Read the final message
+before acting on it; if it describes work in progress, call `wait` again.
+
+`reads` audits a driven agent instead of trusting it. For a memory or recall
+demo, `--match CLAUDE.md` settles whether the agent answered from context or
+quietly re-read the file; if it re-read it, the round is void. Pass `--all`
+whenever the agent might have used a subagent: subagents write separate
+transcripts, and the parent's shows only that a Task was dispatched.
+
+## autodrive.py in detail
+
+```bash
+python ~/.claude/skills/drive-screen/scripts/autodrive.py --id <hwnd> --repo <path> [--dry-run]
+```
+
+Answers the driven session's own permission prompts so a long turn can run while
+nobody is watching. It answers prompts inside that session's terminal UI, and
+cannot answer an operating-system dialog. Start with `--dry-run` on any new task:
+it reports the first prompt and the exact command behind it, then stops without
+sending anything. Three things make it safe enough to leave alone:
+
+- **It stops for a human by default and screenshots what it stopped on** (into
+  `~/.claude/screenctl/prompts/`, without taking focus unless the window is
+  minimized). This is the protection; everything below is secondary.
+- **It presses Enter, never a digit.** Enter takes the highlighted option, which
+  is approve-once. The digit variant means stop asking, and for a Bash command
+  that writes a permanent rule into the repository's settings file.
+- **It refuses a list of commands** and hands back with the command printed:
+  recursive deletes, force pushes, hard resets, `sudo`, piping the network into a
+  shell, publishing, formatting, killing processes, destructive SQL, firewall or
+  sshd changes, and Windows service, registry and scheduled-task writes. If the
+  driven session runs a guard hook, the catastrophic subset is blocked before a
+  prompt ever appears.
+
+Do not rely on that refuse list. A pending permission prompt is usually not in
+the transcript yet. Upstream measured this against a real `rm -rf` prompt sitting
+on screen: 36 records, two completed `ls` calls, and no record of the command
+being asked about; approving it took the file to 44 records and the `rm -rf`
+appeared then. The command is generally written only after it is approved; across
+six live prompts in one session it was readable for three of them. It is a race,
+not a rule. So the refuse list is a second line that often cannot see the thing it
+is filtering, and `autodrive` without `--approve-blind` will mostly just stop,
+because the tool call it wants to read is not there: the safe outcome, and why the
+screenshot exists.
+
+`--approve-blind` is the flag that actually runs a turn unattended, and it is
+exactly what it says: Enter on whatever is on screen, unread. Only for a task whose
+worst case you have already accepted, in a throwaway worktree, with `--shot-dir` so
+there is a record of what was approved. Under auto mode it also needs the user's own
+message naming `--approve-blind` for this run (the classifier's Create Unsafe Agents
+rule covers an agent loop with its approval gate disabled), and it is never used on
+a driven session running in auto mode: there the prompts that reach the screen are
+the classifier's escalations (ask rules, safety checks, the denial-limit fallback),
+the last thing to approve unread.
+
+It also stops if an approval produces no new transcript records, because a
+keystroke that is not landing never starts landing by being repeated. Exit 0 is a
+completed turn; 1 is a timeout with the agent still working (screenshot, do not
+send keys); 2 is approvals not reaching the session, the prompt not being
+photographable, or the approval cap; 3 is a deliberate stop for a human, including
+a missing target or an empty `--session`. `python ~/.claude/skills/drive-screen/scripts/_test_autodrive.py` checks the
+refuse list and the pending-call detection; run it after editing either.
 
 ---
 

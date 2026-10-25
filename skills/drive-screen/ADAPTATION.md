@@ -124,3 +124,44 @@ refused and focus landed through the AttachThreadInput escalation, without reach
 typed punctuation and a pasted multi-line non-ASCII payload both arrived verbatim in a plain Tk
 text box; the click guard allowed the inside point and refused the outside one; the user's text
 clipboard was restored.
+
+## Run plans, UI Automation and OCR
+
+Goal: less wall clock and fewer model turns per task, with every hard rule, trap and safety
+check kept. Deliberate changes:
+
+- `run` (new): a validated plan of up to 30 steps in one call, each sending step
+  focus-verified as before, with `title`/`uia`/`ocr`/`window`/`changed` expects and waits.
+  Reason: most of a task's span is model time, and each input action used to cost a call, a
+  screenshot and a turn; one call and one result replace them. Whole-plan validation refuses
+  Enter (or ctrl+m / ctrl+j / ctrl+o) after text nobody read back (`ENTER_UNVERIFIED`; a typing
+  `key` chord counts as text), a slash command sent without a wait (`SLASH_WAIT`), an expect or
+  read-back wait already true before its send (`EXPECT_ALREADY_TRUE`) or unprovable on a
+  cut-short UIA tree (`EXPECT_UNPROVABLE`); the printed cap is an enforced deadline
+  (`RUN_STOPPED DEADLINE`), funded step by step; a run lock (`BUSY`) stops two senders at once.
+  Inside `run` focus never uses the ALT tap (it is an injected keystroke that goes to whatever
+  window is in front), and a step's `expect` replaces `key`'s fixed 0.3 s post-send wait.
+- Input hardening, CLI and plan alike: a single-character key name is only `a-z`, `0-9` or a
+  named OEM punctuation key (an unmapped character could otherwise land on an unrelated virtual
+  key such as Sleep or the Windows key); `type` refuses control characters (`CONTROL_IN_TYPE`);
+  `scroll` gets the covered-point check `click` has.
+- `uia.py` / `ocr.py` (new): read-only UI Automation and Windows OCR through ctypes, imported
+  lazily by `run` only, so no new package. `click_uia` clicks by exact element name, refuses on
+  ambiguity or truncation, and checks the element under the point (`hit_test`) before pressing.
+  UIA uses `CLSID_CUIAutomation8` so the IUIAutomation2 timeouts are really in force (the old
+  class silently ignored them); every UIA/OCR call is bounded by its step's time left.
+- Focus: escalate to the thread attach at once when the plain foreground request is refused,
+  identity poll every 15 ms, 0.15 s floor, so a typical switch returns in a fraction of the old
+  fixed wait.
+- `shot --region`: crop before the downscale (`REGION_OUTSIDE` if not inside the window), so
+  dense content is readable without paying for a bigger image.
+- Start-up trims and zlib level 1 for the PNG: faster `list` and PNG encode.
+- SKILL.md split: the operative line of every rule and trap stays in SKILL.md; detail moved to
+  references/ (rules.md, traps.md, troubleshooting.md, screenctl-notes.md).
+- `_smoke_windows.py --at X,Y`: place the live test window at a chosen screen position.
+- Kept unchanged on purpose: PrintWindow capture, the owning-process click check, `shot`'s fixed
+  1.0 s settle (a stable-frame early exit can capture before a slow dialog opens), `paste`'s
+  0.1/0.6 s, `type`'s 12 ms per character, `click`'s 0.12 s pointer settle, the fullscreen
+  refusal (screenctl cannot tell which fullscreen app is in front or whether it tolerates
+  injected input).
+- Not done: a local vision model, an MCP server, a long-lived helper process.
